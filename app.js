@@ -37,7 +37,8 @@ const NON_MUSIC_SIGNAL_TERMS = [
   "gameplay", "walkthrough", "playthrough", "speedrun", "tutorial", "guide", "tips", "tricks",
   "stream", "streams", "streamed", "streaming", "full stream", "vod", "livestream archive",
   "playing", "plays", "played", "gaming", "game", "games", "let's play", "lets play",
-  "hollow knight", "silksong", "boss fight", "bosses", "full game", "blind run",
+  "hollow knight", "silksong", "dark souls", "elden ring", "bloodborne", "sekiro",
+  "boss fight", "bosses", "full game", "blind run",
   "wuchang", "fallen feathers",
   "roblox", "minecraft", "fortnite", "valorant", "gta", "doors", "forsaken", "jujutsu",
   "secret button", "build", "building", "builder", "mod", "mods", "update", "patch",
@@ -45,7 +46,8 @@ const NON_MUSIC_SIGNAL_TERMS = [
   "episode", "chapter", "challenge", "test", "take 2", "ranked", "pvp"
 ];
 const HARD_NON_MUSIC_SIGNAL_TERMS = [
-  "hollow knight", "silksong", "wuchang", "fallen feathers", "gameplay", "walkthrough",
+  "hollow knight", "silksong", "dark souls", "elden ring", "bloodborne", "sekiro",
+  "wuchang", "fallen feathers", "gameplay", "walkthrough",
   "playthrough", "speedrun", "full stream", "livestream", "live stream", "vod",
   "playing", "let's play", "lets play", "boss fight", "full game"
 ];
