@@ -169,9 +169,33 @@ function videoLinksFromText(text, source) {
 function invidiousApiBases() {
   return [
     "https://inv.thepixora.com",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yt.chocolatemoo53.com",
     "https://yewtu.be",
     "https://vid.puffyan.us"
   ];
+}
+
+function readerUrl(targetUrl) {
+  return `https://r.jina.ai/http://r.jina.ai/http://${targetUrl}`;
+}
+
+async function readerYoutubeSearch(query, type) {
+  const searchPhrase = type === "channels"
+    ? `${query} music channel`
+    : type === "shorts"
+      ? `${query} music shorts`
+      : `${query} music video`;
+  const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchPhrase).replace(/%20/g, "+")}`;
+  const text = await fetchText(readerUrl(targetUrl), { timeout: 8000 });
+  if (!text) return { count: 0, html: "" };
+
+  const links = videoLinksFromText(text, "youtube-reader");
+  return {
+    count: links.count,
+    html: `\n<!-- Melodify reader source: ${targetUrl} -->\n${text}\n${links.html}`
+  };
 }
 
 async function noKeyVideoSearch(query, type) {
@@ -276,12 +300,13 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
 
   const resultCount = type === "channel-videos" || type === "shorts" ? 100 : 50;
   const noKey = await noKeyVideoSearch(query, type);
-  let combined = noKey.html;
+  const reader = await readerYoutubeSearch(query, type);
+  let combined = `${noKey.html}\n${reader.html}`;
   let successCount = 0;
   let videoLinkCount = 0;
 
   for (const searchQuery of searchQueries.slice(0, 3)) {
-    if (noKey.count >= 24 && type !== "channels") break;
+    if (noKey.count + reader.count >= 24 && type !== "channels") break;
     const encodedQuery = encodeURIComponent(searchQuery);
     const searchUrls = [
       `https://www.bing.com/search?count=${resultCount}&q=${encodedQuery}`,
@@ -296,13 +321,13 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
       combined += `\n<!-- Melodify source: ${searchUrl} -->\n${text}\n${links.html}`;
       successCount += 1;
       videoLinkCount += links.count;
-      if (videoLinkCount + noKey.count >= 60) break;
+      if (videoLinkCount + noKey.count + reader.count >= 60) break;
     }
 
-    if (videoLinkCount + noKey.count >= 60) break;
+    if (videoLinkCount + noKey.count + reader.count >= 60) break;
   }
 
-  if (successCount > 0 || noKey.count > 0) sendResponse(res, 200, "OK", "text/html; charset=utf-8", combined, headOnly);
+  if (successCount > 0 || noKey.count > 0 || reader.count > 0) sendResponse(res, 200, "OK", "text/html; charset=utf-8", combined, headOnly);
   else sendText(res, 502, "Bad Gateway", "Discovery unavailable.", headOnly);
 }
 
