@@ -843,7 +843,7 @@ async function maybeLoadRouteData() {
     shouldAutoLoadChannelPage(state.activeChannelId, activeCache)
   ) {
     channelAutoLoadRequests.set(state.activeChannelId, Date.now());
-    await loadChannelVideos(state.activeChannelId, true);
+    loadChannelVideos(state.activeChannelId, true).catch(() => {});
   }
 
   if (state.route === "recommended" && !state.loading && !state.dailyPlaylists.playlists.length) {
@@ -1366,19 +1366,18 @@ async function loadChannelVideos(channelId, append) {
 
   if (!isRssChannelId(channelId)) {
     state.channelCache[channelId] = { channel, videos: storedVideos, nextPageToken: "", loading: false };
-    await expandChannelDiscovery(channelId, append);
     render();
+    expandChannelDiscovery(channelId, append).catch(() => {});
     return;
   }
 
   state.channelCache[channelId] = { ...existing, channel, videos: uniqueVideos([...(existing.videos || []), ...storedVideos]), loading: true };
   render();
 
-  try {
-    await refreshChannelLibrary(channelId, { force: true, quiet: append !== true });
-  } finally {
-    render();
-  }
+  // Show cached videos immediately, then refresh in the background and append discoveries.
+  refreshChannelLibrary(channelId, { force: true, quiet: append !== true })
+    .catch(() => {})
+    .finally(() => render());
 }
 
 async function expandChannelDiscovery(channelId, force) {
