@@ -2,6 +2,7 @@ services:
   - type: web
     name: melodify
     runtime: node
+    plan: free
     buildCommand: npm install
     startCommand: npm start
     autoDeploy: true
