@@ -166,6 +166,25 @@ function videoLinksFromText(text, source) {
   };
 }
 
+function channelLinksFromText(text, source) {
+  const ids = new Set();
+  const patterns = [
+    /"authorId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"/gi,
+    /"authorUrl"\s*:\s*"\/channel\/(UC[A-Za-z0-9_-]{22})"/gi,
+    /(?:https?:\/\/(?:www\.)?youtube\.com)?\/channel\/(UC[A-Za-z0-9_-]{22})/gi,
+    /(?:^|[^A-Za-z0-9_-])(UC[A-Za-z0-9_-]{22})(?:$|[^A-Za-z0-9_-])/g
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of String(text || "").matchAll(pattern)) ids.add(match[1]);
+  }
+
+  return {
+    count: ids.size,
+    html: [...ids].map((id) => `<a data-source="${source}" href="https://www.youtube.com/channel/${id}">YouTube channel ${id}</a>`).join("\n")
+  };
+}
+
 function invidiousApiBases() {
   return [
     "https://inv.thepixora.com",
@@ -192,9 +211,10 @@ async function readerYoutubeSearch(query, type) {
   if (!text) return { count: 0, html: "" };
 
   const links = videoLinksFromText(text, "youtube-reader");
+  const channels = channelLinksFromText(text, "youtube-reader");
   return {
-    count: links.count,
-    html: `\n<!-- Melodify reader source: ${targetUrl} -->\n${text}\n${links.html}`
+    count: links.count + channels.count,
+    html: `\n<!-- Melodify reader source: ${targetUrl} -->\n${text}\n${links.html}\n${channels.html}`
   };
 }
 
@@ -219,9 +239,10 @@ async function noKeyVideoSearch(query, type) {
   for (const remoteUrl of pipedUrls) {
     const text = await fetchText(remoteUrl, { timeout: 3000, accept: "application/json" });
     if (!text) continue;
-    const links = videoLinksFromText(text, "piped");
-    html += `\n<!-- Melodify no-key source: ${remoteUrl} -->\n${text}\n${links.html}`;
-    count += links.count;
+      const links = videoLinksFromText(text, "piped");
+      const channels = channelLinksFromText(text, "piped");
+      html += `\n<!-- Melodify no-key source: ${remoteUrl} -->\n${text}\n${links.html}\n${channels.html}`;
+      count += links.count + channels.count;
     if (count >= targetCount) return { count, html };
   }
 
@@ -232,8 +253,9 @@ async function noKeyVideoSearch(query, type) {
       const text = await fetchText(remoteUrl, { timeout: 3000, accept: "application/json" });
       if (!text) continue;
       const links = videoLinksFromText(text, "invidious");
-      html += `\n<!-- Melodify no-key source: ${remoteUrl} -->\n${text}\n${links.html}`;
-      count += links.count;
+      const channels = channelLinksFromText(text, "invidious");
+      html += `\n<!-- Melodify no-key source: ${remoteUrl} -->\n${text}\n${links.html}\n${channels.html}`;
+      count += links.count + channels.count;
       if (count >= targetCount) return { count, html };
     }
   }
@@ -299,8 +321,12 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
   }
 
   const resultCount = type === "channel-videos" || type === "shorts" ? 100 : 50;
-  const noKey = await noKeyVideoSearch(query, type);
-  const reader = await readerYoutubeSearch(query, type);
+  const [readerResult, noKeyResult] = await Promise.allSettled([
+    readerYoutubeSearch(query, type),
+    noKeyVideoSearch(query, type)
+  ]);
+  const reader = readerResult.status === "fulfilled" ? readerResult.value : { count: 0, html: "" };
+  const noKey = noKeyResult.status === "fulfilled" ? noKeyResult.value : { count: 0, html: "" };
   let combined = `${noKey.html}\n${reader.html}`;
   let successCount = 0;
   let videoLinkCount = 0;

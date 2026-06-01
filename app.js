@@ -15,7 +15,7 @@ const APP_UPDATE_RELOAD_DELAY_MS = 1200;
 const APP_UPDATE_SERVER_RELOAD_DELAY_MS = 3200;
 const LOCAL_APP_HELP = "Open Melodify from the Desktop or Start Menu shortcut to discover new videos.";
 const LOCAL_PLAYER_HELP = "Open Melodify from the Desktop or Start Menu shortcut to play YouTube videos inside the app.";
-const SEARCH_DISCOVERY_TIMEOUT_MS = 6000;
+const SEARCH_DISCOVERY_TIMEOUT_MS = 20000;
 const VIDEO_IMPORT_CONCURRENCY = 6;
 const VIDEO_SEARCH_IMPORT_LIMIT = 24;
 const CHANNEL_DISCOVERY_IMPORT_LIMIT = 140;
@@ -1078,6 +1078,11 @@ function extractYoutubeChannelIds(text) {
   const decoded = decodeHtmlEntities(text || "");
   const directPattern = /(?:https?:\/\/(?:www\.|m\.)?youtube\.com)?\/channel\/(UC[A-Za-z0-9_-]{22})/gi;
   for (const match of decoded.matchAll(directPattern)) {
+    ids.add(match[1]);
+  }
+
+  const rawChannelPattern = /(?:^|[^A-Za-z0-9_-])(UC[A-Za-z0-9_-]{22})(?:$|[^A-Za-z0-9_-])/g;
+  for (const match of decoded.matchAll(rawChannelPattern)) {
     ids.add(match[1]);
   }
 
