@@ -51,6 +51,16 @@ const HARD_NON_MUSIC_SIGNAL_TERMS = [
   "playthrough", "speedrun", "full stream", "livestream", "live stream", "vod",
   "playing", "let's play", "lets play", "boss fight", "full game"
 ];
+const GAME_TITLE_SIGNAL_TERMS = [
+  "hollow knight", "silksong", "dark souls", "darksouls", "elden ring", "bloodborne", "sekiro",
+  "wuchang", "fallen feathers"
+];
+const TITLE_GAMEPLAY_CONTEXT_TERMS = [
+  "live", "stream", "streams", "streaming", "vod", "gameplay", "walkthrough", "playthrough",
+  "let's play", "lets play", "playing", "boss", "bosses", "boss fight", "full game",
+  "day", "part", "pt", "finale", "hindi", "addicted", "harder", "lost", "rage",
+  "first time", "blind", "run", "no hit", "challenge", "dlc", "ng+"
+];
 const STRONG_MUSIC_SIGNAL_TERMS = [
   "music video", "official music video", "official video", "official audio", "song",
   "lyrics", "lyric video", "visualizer", "remix", "cover", "instrumental", "beat",
@@ -2801,8 +2811,14 @@ function isLikelyMusicVideo(video, query = "") {
   if (String(video.channelId || "").startsWith("demo-")) return true;
 
   const text = searchable(video);
+  const titleText = String(video.title || "").toLowerCase();
   const visibleText = `${video.title || ""} ${video.channelTitle || ""} ${video.description || ""}`.toLowerCase();
   const queryText = String(query || "").toLowerCase();
+  const hasGameTitleSignal = hasTermSignal(titleText, GAME_TITLE_SIGNAL_TERMS);
+  const hasTitleGameplayContext = hasTermSignal(titleText, TITLE_GAMEPLAY_CONTEXT_TERMS);
+  const hasTitleMusicSignal = hasTermSignal(titleText, STRONG_MUSIC_SIGNAL_TERMS) || hasGenreSignal(titleText);
+  if (hasGameTitleSignal && hasTitleGameplayContext && !hasTitleMusicSignal) return false;
+
   const hasStrongMusicSignal = hasTermSignal(visibleText, STRONG_MUSIC_SIGNAL_TERMS) || hasGenreSignal(visibleText);
   const hasHardNonMusicSignal = hasTermSignal(visibleText, HARD_NON_MUSIC_SIGNAL_TERMS);
   if (hasHardNonMusicSignal && !hasStrongMusicSignal) return false;
