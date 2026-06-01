@@ -24,6 +24,33 @@ const BLOCKED_STATIC_PATTERNS = [
   /\.(?:bat|ps1|vbs)$/i,
   /^(?:server\.js|package(?:-lock)?\.json|render\.yaml)$/i
 ];
+const GENRE_ALIASES = {
+  phonk: ["phonk", "drift phonk", "memphis rap"],
+  lofi: ["lofi", "lo-fi", "lofi hip hop", "chillhop", "study beats", "study music"],
+  hiphop: ["hip hop", "hip-hop", "hiphop", "rap", "trap", "drill", "boom bap"],
+  rap: ["rap", "hip hop", "trap", "drill"],
+  edm: ["edm", "electronic", "dance", "house", "dubstep", "future bass", "techno", "trance", "hardstyle", "breakcore"],
+  electronic: ["electronic", "edm", "synthwave", "chiptune", "dubstep", "house", "ambient"],
+  rock: ["rock", "alternative rock", "alt rock", "indie rock", "metal", "punk"],
+  pop: ["pop", "dance pop", "indie pop", "kpop", "k-pop"],
+  kpop: ["kpop", "k-pop", "korean pop"],
+  rnb: ["rnb", "r&b", "rhythm and blues", "soul"],
+  country: ["country", "country music"],
+  jazz: ["jazz", "smooth jazz"],
+  classical: ["classical", "orchestra", "orchestral", "piano", "violin"],
+  indie: ["indie", "indie pop", "indie rock", "alternative", "bedroom pop"],
+  reggae: ["reggae", "dancehall"],
+  latin: ["latin", "reggaeton", "bachata", "salsa"],
+  funk: ["funk", "future funk", "disco"],
+  metal: ["metal", "heavy metal", "metalcore"],
+  punk: ["punk", "pop punk"],
+  synthwave: ["synthwave", "retrowave", "outrun"],
+  drumandbass: ["drum and bass", "drum n bass", "dnb", "jungle"],
+  anime: ["anime", "jpop", "j-pop", "vocaloid"],
+  chill: ["chill", "chill music", "chillout", "ambient"],
+  soundtrack: ["soundtrack", "ost", "score", "theme"],
+  gospel: ["gospel", "worship", "christian music"]
+};
 
 function sendResponse(res, statusCode, statusText, contentType, body, headOnly = false) {
   const payload = Buffer.isBuffer(body) ? body : Buffer.from(String(body || ""), "utf8");
@@ -201,20 +228,22 @@ function readerUrl(targetUrl) {
 }
 
 async function readerYoutubeSearch(query, type) {
-  const searchPhrase = type === "channels"
-    ? `${query} music channel`
-    : type === "shorts"
-      ? `${query} music shorts`
-      : `${query} music video`;
-  const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchPhrase).replace(/%20/g, "+")}`;
-  const text = await fetchText(readerUrl(targetUrl), { timeout: 8000 });
-  if (!text) return { count: 0, html: "" };
+  let count = 0;
+  let html = "";
+  for (const searchPhrase of searchPhrasesForQuery(query, type).slice(0, 2)) {
+    const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchPhrase).replace(/%20/g, "+")}`;
+    const text = await fetchText(readerUrl(targetUrl), { timeout: 8000 });
+    if (!text) continue;
 
-  const links = videoLinksFromText(text, "youtube-reader");
-  const channels = channelLinksFromText(text, "youtube-reader");
+    const links = videoLinksFromText(text, "youtube-reader");
+    const channels = channelLinksFromText(text, "youtube-reader");
+    count += links.count + channels.count;
+    html += `\n<!-- Melodify reader source: ${targetUrl} -->\n${text}\n${links.html}\n${channels.html}`;
+    if (count >= 50) break;
+  }
   return {
-    count: links.count + channels.count,
-    html: `\n<!-- Melodify reader source: ${targetUrl} -->\n${text}\n${links.html}\n${channels.html}`
+    count,
+    html
   };
 }
 
@@ -224,8 +253,7 @@ async function noKeyVideoSearch(query, type) {
   let html = "";
   let count = 0;
   const targetCount = type === "channel-videos" ? 80 : type === "shorts" ? 60 : 30;
-  const searchPhrase = type === "shorts" ? `${query} music shorts` : type === "channel-videos" ? `${query} music videos` : `${query} music video`;
-  const encodedQuery = encodeURIComponent(searchPhrase);
+  const encodedQuery = encodeURIComponent(searchPhrasesForQuery(query, type)[0]);
   const pages = type === "channel-videos" || type === "shorts" ? [1, 2, 3] : [1, 2];
   const pipedUrls = pages.flatMap((page) => [
     `https://pipedapi.kavin.rocks/search?q=${encodedQuery}&filter=videos&page=${page}`,
@@ -298,17 +326,21 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
   }
 
   const searchQueries = [];
+  const genreTerms = queryGenreTerms(query);
   if (type === "channels") {
     searchQueries.push(`(site:youtube.com/channel/UC OR site:youtube.com/@) ${query} YouTube channel`);
     searchQueries.push(`${query} music YouTube channel`);
     searchQueries.push(`${query} artist YouTube channel`);
+    for (const genre of genreTerms.slice(0, 2)) searchQueries.push(`${genre} artist YouTube channel`);
   } else if (type === "shorts") {
     searchQueries.push(`site:youtube.com/shorts ${query} music`);
     searchQueries.push(`${query} YouTube shorts`);
+    for (const genre of genreTerms.slice(0, 2)) searchQueries.push(`${genre} music shorts`);
   } else if (type === "channel-videos") {
     searchQueries.push(`site:youtube.com/watch ${query} music`);
     searchQueries.push(`${query} YouTube music videos`);
     searchQueries.push(`${query} official music videos`);
+    for (const genre of genreTerms.slice(0, 2)) searchQueries.push(`${genre} music videos`);
   } else {
     searchQueries.push(`site:youtube.com/watch ${query} music`);
     searchQueries.push(`site:youtu.be ${query} music`);
@@ -318,6 +350,10 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
     searchQueries.push(`${query} official music video`);
     searchQueries.push(`${query} lyrics`);
     searchQueries.push(`${query} official audio`);
+    for (const genre of genreTerms.slice(0, 2)) {
+      searchQueries.push(`${genre} music mix YouTube`);
+      searchQueries.push(`${genre} playlist YouTube`);
+    }
   }
 
   const resultCount = type === "channel-videos" || type === "shorts" ? 100 : 50;
@@ -399,3 +435,74 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Melodify is listening on port ${PORT}`);
 });
+
+function searchPhrasesForQuery(query, type) {
+  const cleanQuery = String(query || "").trim();
+  const genreTerms = queryGenreTerms(query);
+  const phraseGenres = preferredSearchGenreTerms(cleanQuery, genreTerms);
+  const phrases = [];
+  if (type === "channels") {
+    phrases.push(`${cleanQuery} music channel`);
+    phrases.push(`${cleanQuery} artist channel`);
+    phraseGenres.forEach((genre) => phrases.push(`${genre} music channel`));
+  } else if (type === "shorts") {
+    phrases.push(`${cleanQuery} music shorts`);
+    phraseGenres.forEach((genre) => phrases.push(`${genre} music shorts`));
+  } else if (type === "channel-videos") {
+    phrases.push(`${cleanQuery} music videos`);
+    phraseGenres.forEach((genre) => phrases.push(`${genre} music videos`));
+  } else {
+    phrases.push(`${cleanQuery} music video`);
+    phrases.push(`${cleanQuery} song`);
+    phrases.push(`${cleanQuery} mix`);
+    phrases.push(`${cleanQuery} official audio`);
+    phraseGenres.forEach((genre) => {
+      phrases.push(`${genre} music video`);
+      phrases.push(`${genre} songs`);
+      phrases.push(`${genre} mix`);
+      phrases.push(`${genre} playlist`);
+    });
+  }
+  return [...new Set(phrases.filter(Boolean))];
+}
+
+function preferredSearchGenreTerms(query, genreTerms) {
+  return [...new Set([query, ...genreTerms])]
+    .map((term) => String(term || "").trim())
+    .filter((term) => term.length > 2)
+    .slice(0, 4);
+}
+
+function queryGenreTerms(query) {
+  const normalizedQuery = normalizeKey(query);
+  const queryTokens = new Set(tokenize(query));
+  const terms = new Set();
+  for (const [canonical, aliases] of Object.entries(GENRE_ALIASES)) {
+    const matched = aliases.some((alias) => genreAliasMatchesQuery(alias, normalizedQuery, queryTokens));
+    if (!matched) continue;
+    terms.add(canonical);
+    aliases.forEach((alias) => terms.add(alias));
+  }
+  return [...terms];
+}
+
+function genreAliasMatchesQuery(alias, normalizedQuery, queryTokens) {
+  const normalizedAlias = normalizeKey(alias);
+  const aliasTokens = tokenize(alias);
+  if (!normalizedAlias) return false;
+  if (aliasTokens.length > 1) {
+    return normalizedQuery.includes(normalizedAlias) || aliasTokens.every((token) => queryTokens.has(token));
+  }
+  if (aliasTokens.length === 1) {
+    return queryTokens.has(aliasTokens[0]) || normalizedQuery === normalizedAlias;
+  }
+  return normalizedQuery === normalizedAlias;
+}
+
+function tokenize(value) {
+  return String(value || "").toLowerCase().split(/[^a-z0-9]+/g).filter((token) => token.length > 2);
+}
+
+function normalizeKey(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}

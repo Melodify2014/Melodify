@@ -38,6 +38,33 @@ const NON_MUSIC_SIGNAL_TERMS = [
   "trailer", "teaser", "movie actors", "reaction", "vlog", "livestream", "live stream",
   "episode", "chapter", "challenge", "test", "take 2", "ranked", "pvp"
 ];
+const GENRE_ALIASES = {
+  phonk: ["phonk", "drift phonk", "memphis rap"],
+  lofi: ["lofi", "lo-fi", "lofi hip hop", "chillhop", "study beats", "study music"],
+  hiphop: ["hip hop", "hip-hop", "hiphop", "rap", "trap", "drill", "boom bap"],
+  rap: ["rap", "hip hop", "trap", "drill"],
+  edm: ["edm", "electronic", "dance", "house", "dubstep", "future bass", "techno", "trance", "hardstyle", "breakcore"],
+  electronic: ["electronic", "edm", "synthwave", "chiptune", "dubstep", "house", "ambient"],
+  rock: ["rock", "alternative rock", "alt rock", "indie rock", "metal", "punk"],
+  pop: ["pop", "dance pop", "indie pop", "kpop", "k-pop"],
+  kpop: ["kpop", "k-pop", "korean pop"],
+  rnb: ["rnb", "r&b", "rhythm and blues", "soul"],
+  country: ["country", "country music"],
+  jazz: ["jazz", "smooth jazz"],
+  classical: ["classical", "orchestra", "orchestral", "piano", "violin"],
+  indie: ["indie", "indie pop", "indie rock", "alternative", "bedroom pop"],
+  reggae: ["reggae", "dancehall"],
+  latin: ["latin", "reggaeton", "bachata", "salsa"],
+  funk: ["funk", "future funk", "disco"],
+  metal: ["metal", "heavy metal", "metalcore"],
+  punk: ["punk", "pop punk"],
+  synthwave: ["synthwave", "retrowave", "outrun"],
+  drumandbass: ["drum and bass", "drum n bass", "dnb", "jungle"],
+  anime: ["anime", "jpop", "j-pop", "vocaloid"],
+  chill: ["chill", "chill music", "chillout", "ambient"],
+  soundtrack: ["soundtrack", "ost", "score", "theme"],
+  gospel: ["gospel", "worship", "christian music"]
+};
 
 const icons = {
   home: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M9 20v-6h6v6"/></svg>',
@@ -1193,7 +1220,10 @@ async function importVideoFromUrl(value, options = {}) {
     if (requireMusic && !musicAccepted) {
       return null;
     }
-    if (musicAccepted) video.tags = [...new Set([...(video.tags || []), "music"])];
+    const searchGenreTags = queryGenreTerms(query);
+    if (musicAccepted || searchGenreTags.length) {
+      video.tags = [...new Set([...(video.tags || []), "music", ...searchGenreTags])];
+    }
     cacheChannel(channel, "oembed", false);
     cacheVideo(video, "oembed", false);
     cacheChannelVideos(channel.id, [video], false, { markFetched: false });
@@ -2613,23 +2643,43 @@ function matchesSearchIntent(item, query) {
 
 function queryMatchScore(item, query) {
   const tokens = queryIntentTokens(query);
-  if (!tokens.length) return 0;
+  const genreTerms = queryGenreTerms(query);
+  if (!tokens.length && !genreTerms.length) return 0;
   const text = searchable(item);
   const phrase = String(query || "").trim().toLowerCase();
   const matched = tokens.filter((token) => tokenMatchesItem(token, item));
-  const required = tokens.length <= 2 ? tokens.length : Math.max(2, Math.ceil(tokens.length * 0.75));
-  if (matched.length < required) return Number.NEGATIVE_INFINITY;
+  const matchedGenres = genreTerms.filter((term) => tokenInText(term, text));
+  const genreTokens = new Set(tokenize(genreTerms.join(" ")));
+  const nonGenreTokens = tokens.filter((token) => !genreTokens.has(token));
+
+  if (genreTerms.length) {
+    if (!matchedGenres.length) return Number.NEGATIVE_INFINITY;
+    if (nonGenreTokens.length) {
+      const matchedNonGenre = nonGenreTokens.filter((token) => tokenMatchesItem(token, item));
+      const requiredNonGenre = nonGenreTokens.length <= 2 ? nonGenreTokens.length : Math.max(2, Math.ceil(nonGenreTokens.length * 0.75));
+      if (matchedNonGenre.length < requiredNonGenre) return Number.NEGATIVE_INFINITY;
+    }
+  } else {
+    const required = tokens.length <= 2 ? tokens.length : Math.max(2, Math.ceil(tokens.length * 0.75));
+    if (matched.length < required) return Number.NEGATIVE_INFINITY;
+  }
 
   const title = String(item.title || "").toLowerCase();
   const channel = String(item.channelTitle || item.title || "").toLowerCase();
   const tagText = Array.isArray(item.tags) ? item.tags.join(" ").toLowerCase() : "";
-  let score = matched.length * 12 + (matched.length / tokens.length) * 20;
+  const tokenScoreBase = tokens.length ? (matched.length / tokens.length) * 20 : 0;
+  let score = matched.length * 12 + tokenScoreBase + matchedGenres.length * 18;
   if (phrase && text.includes(phrase)) score += 35;
-  if (matched.length === tokens.length) score += 16;
+  if (tokens.length && matched.length === tokens.length) score += 16;
+  if (genreTerms.length && matchedGenres.length) score += 18;
   for (const token of matched) {
     if (tokenInText(token, title)) score += 5;
     if (tokenInText(token, channel)) score += 4;
     if (tokenInText(token, tagText)) score += 3;
+  }
+  for (const genre of matchedGenres) {
+    if (tokenInText(genre, title)) score += 6;
+    if (tokenInText(genre, tagText)) score += 5;
   }
   return score;
 }
@@ -2663,13 +2713,47 @@ function isLikelyMusicVideo(video, query = "") {
 
   const text = searchable(video);
   const queryText = String(query || "").toLowerCase();
-  const hasMusicSignal = hasTermSignal(text, MUSIC_SIGNAL_TERMS);
+  const hasMusicSignal = hasTermSignal(text, MUSIC_SIGNAL_TERMS) || hasGenreSignal(text);
   const hasNonMusicSignal = hasTermSignal(text, NON_MUSIC_SIGNAL_TERMS);
   if (hasNonMusicSignal && !hasMusicSignal) return false;
   if (hasMusicSignal) return true;
   if (looksLikeArtistSongResult(video, query) && !hasNonMusicSignal) return true;
-  if (hasTermSignal(queryText, MUSIC_SIGNAL_TERMS) && !hasNonMusicSignal) return true;
+  if ((hasTermSignal(queryText, MUSIC_SIGNAL_TERMS) || hasGenreSignal(queryText)) && !hasNonMusicSignal) return true;
   return isFollowing(video.channelId) && !hasNonMusicSignal;
+}
+
+function allGenreTerms() {
+  return Object.values(GENRE_ALIASES).flat();
+}
+
+function queryGenreTerms(query) {
+  const normalizedQuery = normalizeCreatorKey(query);
+  const queryTokens = new Set(tokenize(query));
+  const terms = new Set();
+  for (const [canonical, aliases] of Object.entries(GENRE_ALIASES)) {
+    const matched = aliases.some((alias) => genreAliasMatchesQuery(alias, normalizedQuery, queryTokens));
+    if (!matched) continue;
+    terms.add(canonical);
+    aliases.forEach((alias) => terms.add(alias));
+  }
+  return [...terms];
+}
+
+function genreAliasMatchesQuery(alias, normalizedQuery, queryTokens) {
+  const normalizedAlias = normalizeCreatorKey(alias);
+  const aliasTokens = tokenize(alias);
+  if (!normalizedAlias) return false;
+  if (aliasTokens.length > 1) {
+    return normalizedQuery.includes(normalizedAlias) || aliasTokens.every((token) => queryTokens.has(token));
+  }
+  if (aliasTokens.length === 1) {
+    return queryTokens.has(aliasTokens[0]) || normalizedQuery === normalizedAlias;
+  }
+  return normalizedQuery === normalizedAlias;
+}
+
+function hasGenreSignal(text) {
+  return hasTermSignal(text, allGenreTerms());
 }
 
 function looksLikeArtistSongResult(video, query) {
