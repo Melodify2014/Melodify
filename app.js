@@ -35,6 +35,9 @@ const MUSIC_SIGNAL_TERMS = [
 ];
 const NON_MUSIC_SIGNAL_TERMS = [
   "gameplay", "walkthrough", "playthrough", "speedrun", "tutorial", "guide", "tips", "tricks",
+  "stream", "streams", "streamed", "streaming", "full stream", "vod", "livestream archive",
+  "playing", "plays", "played", "gaming", "game", "games", "let's play", "lets play",
+  "hollow knight", "silksong", "boss fight", "bosses", "full game", "blind run",
   "roblox", "minecraft", "fortnite", "valorant", "gta", "doors", "forsaken", "jujutsu",
   "secret button", "build", "building", "builder", "mod", "mods", "update", "patch",
   "trailer", "teaser", "movie actors", "reaction", "vlog", "livestream", "live stream",
