@@ -38,10 +38,23 @@ const NON_MUSIC_SIGNAL_TERMS = [
   "stream", "streams", "streamed", "streaming", "full stream", "vod", "livestream archive",
   "playing", "plays", "played", "gaming", "game", "games", "let's play", "lets play",
   "hollow knight", "silksong", "boss fight", "bosses", "full game", "blind run",
+  "wuchang", "fallen feathers",
   "roblox", "minecraft", "fortnite", "valorant", "gta", "doors", "forsaken", "jujutsu",
   "secret button", "build", "building", "builder", "mod", "mods", "update", "patch",
   "trailer", "teaser", "movie actors", "reaction", "vlog", "livestream", "live stream",
   "episode", "chapter", "challenge", "test", "take 2", "ranked", "pvp"
+];
+const HARD_NON_MUSIC_SIGNAL_TERMS = [
+  "hollow knight", "silksong", "wuchang", "fallen feathers", "gameplay", "walkthrough",
+  "playthrough", "speedrun", "full stream", "livestream", "live stream", "vod",
+  "playing", "let's play", "lets play", "boss fight", "full game"
+];
+const STRONG_MUSIC_SIGNAL_TERMS = [
+  "music video", "official music video", "official video", "official audio", "song",
+  "lyrics", "lyric video", "visualizer", "remix", "cover", "instrumental", "beat",
+  "beats", "album", "ep", "soundtrack", "ost", "theme", "acoustic", "live performance",
+  "performance", "karaoke", "slowed", "reverb", "sped up", "nightcore", "mashup",
+  "dj set", "prod", "producer", "records", "recordings", "vevo", "topic"
 ];
 const GENRE_ALIASES = {
   phonk: ["phonk", "drift phonk", "memphis rap"],
@@ -2786,10 +2799,15 @@ function isLikelyMusicVideo(video, query = "") {
   if (String(video.channelId || "").startsWith("demo-")) return true;
 
   const text = searchable(video);
+  const visibleText = `${video.title || ""} ${video.channelTitle || ""} ${video.description || ""}`.toLowerCase();
   const queryText = String(query || "").toLowerCase();
+  const hasStrongMusicSignal = hasTermSignal(visibleText, STRONG_MUSIC_SIGNAL_TERMS) || hasGenreSignal(visibleText);
+  const hasHardNonMusicSignal = hasTermSignal(visibleText, HARD_NON_MUSIC_SIGNAL_TERMS);
+  if (hasHardNonMusicSignal && !hasStrongMusicSignal) return false;
+
   const hasMusicSignal = hasTermSignal(text, MUSIC_SIGNAL_TERMS) || hasGenreSignal(text);
-  const hasNonMusicSignal = hasTermSignal(text, NON_MUSIC_SIGNAL_TERMS);
-  if (hasNonMusicSignal && !hasMusicSignal) return false;
+  const hasNonMusicSignal = hasTermSignal(visibleText, NON_MUSIC_SIGNAL_TERMS);
+  if (hasNonMusicSignal && !hasStrongMusicSignal) return false;
   if (hasMusicSignal) return true;
   if (looksLikeArtistSongResult(video, query) && !hasNonMusicSignal) return true;
   if ((hasTermSignal(queryText, MUSIC_SIGNAL_TERMS) || hasGenreSignal(queryText)) && !hasNonMusicSignal) return true;
