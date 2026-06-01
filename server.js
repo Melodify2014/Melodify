@@ -7,6 +7,9 @@ const http = require("node:http");
 
 const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 8788);
+const DISCOVERY_BUDGET_MS = 10000;
+const DISCOVERY_READER_TIMEOUT_MS = 4500;
+const DISCOVERY_SOURCE_TIMEOUT_MS = 2000;
 const VERSION_FILES = [
   "index.html",
   "styles.css",
@@ -154,6 +157,7 @@ function isYoutubeUrl(value) {
 
 async function fetchText(remoteUrl, options = {}) {
   const { timeout = 3500, accept = "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7" } = options;
+  if (timeout <= 0) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
@@ -227,12 +231,14 @@ function readerUrl(targetUrl) {
   return `https://r.jina.ai/http://r.jina.ai/http://${targetUrl}`;
 }
 
-async function readerYoutubeSearch(query, type) {
+async function readerYoutubeSearch(query, type, deadline) {
   let count = 0;
   let html = "";
   for (const searchPhrase of searchPhrasesForQuery(query, type).slice(0, 2)) {
+    const timeout = discoveryTimeout(deadline, DISCOVERY_READER_TIMEOUT_MS);
+    if (!timeout) break;
     const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchPhrase).replace(/%20/g, "+")}`;
-    const text = await fetchText(readerUrl(targetUrl), { timeout: 8000 });
+    const text = await fetchText(readerUrl(targetUrl), { timeout });
     if (!text) continue;
 
     const links = videoLinksFromText(text, "youtube-reader");
@@ -247,14 +253,14 @@ async function readerYoutubeSearch(query, type) {
   };
 }
 
-async function noKeyVideoSearch(query, type) {
+async function noKeyVideoSearch(query, type, deadline) {
   if (type === "channels") return { count: 0, html: "" };
 
   let html = "";
   let count = 0;
   const targetCount = type === "channel-videos" ? 80 : type === "shorts" ? 60 : 30;
   const encodedQuery = encodeURIComponent(searchPhrasesForQuery(query, type)[0]);
-  const pages = type === "channel-videos" || type === "shorts" ? [1, 2, 3] : [1, 2];
+  const pages = type === "channel-videos" || type === "shorts" ? [1, 2] : [1];
   const pipedUrls = pages.flatMap((page) => [
     `https://pipedapi.kavin.rocks/search?q=${encodedQuery}&filter=videos&page=${page}`,
     `https://pipedapi.adminforge.de/search?q=${encodedQuery}&filter=videos&page=${page}`
@@ -265,7 +271,9 @@ async function noKeyVideoSearch(query, type) {
   );
 
   for (const remoteUrl of pipedUrls) {
-    const text = await fetchText(remoteUrl, { timeout: 3000, accept: "application/json" });
+    const timeout = discoveryTimeout(deadline, DISCOVERY_SOURCE_TIMEOUT_MS);
+    if (!timeout) break;
+    const text = await fetchText(remoteUrl, { timeout, accept: "application/json" });
     if (!text) continue;
       const links = videoLinksFromText(text, "piped");
       const channels = channelLinksFromText(text, "piped");
@@ -277,8 +285,10 @@ async function noKeyVideoSearch(query, type) {
   const duration = type === "shorts" ? "&duration=short" : "";
   for (const base of invidiousApiBases()) {
     for (const page of pages) {
+      const timeout = discoveryTimeout(deadline, DISCOVERY_SOURCE_TIMEOUT_MS);
+      if (!timeout) break;
       const remoteUrl = `${base}/api/v1/search?q=${encodedQuery}&type=video${duration}&page=${page}`;
-      const text = await fetchText(remoteUrl, { timeout: 3000, accept: "application/json" });
+      const text = await fetchText(remoteUrl, { timeout, accept: "application/json" });
       if (!text) continue;
       const links = videoLinksFromText(text, "invidious");
       const channels = channelLinksFromText(text, "invidious");
@@ -320,6 +330,7 @@ async function sendYoutubeOembed(res, url, headOnly) {
 async function sendYoutubeDiscovery(res, url, headOnly) {
   const query = queryValue(url, "q").trim();
   const type = queryValue(url, "type").trim().toLowerCase();
+  const deadline = Date.now() + DISCOVERY_BUDGET_MS;
   if (!query || query.length > 120) {
     sendText(res, 400, "Bad Request", "Invalid search query.", headOnly);
     return;
@@ -358,8 +369,8 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
 
   const resultCount = type === "channel-videos" || type === "shorts" ? 100 : 50;
   const [readerResult, noKeyResult] = await Promise.allSettled([
-    readerYoutubeSearch(query, type),
-    noKeyVideoSearch(query, type)
+    readerYoutubeSearch(query, type, deadline),
+    noKeyVideoSearch(query, type, deadline)
   ]);
   const reader = readerResult.status === "fulfilled" ? readerResult.value : { count: 0, html: "" };
   const noKey = noKeyResult.status === "fulfilled" ? noKeyResult.value : { count: 0, html: "" };
@@ -367,17 +378,19 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
   let successCount = 0;
   let videoLinkCount = 0;
 
-  for (const searchQuery of searchQueries.slice(0, 3)) {
+  for (const searchQuery of searchQueries.slice(0, 2)) {
+    if (!discoveryTimeout(deadline, DISCOVERY_SOURCE_TIMEOUT_MS)) break;
     if (noKey.count + reader.count >= 24 && type !== "channels") break;
     const encodedQuery = encodeURIComponent(searchQuery);
     const searchUrls = [
       `https://www.bing.com/search?count=${resultCount}&q=${encodedQuery}`,
-      `https://duckduckgo.com/html/?q=${encodedQuery}`,
-      `https://www.google.com/search?num=${resultCount}&hl=en&q=${encodedQuery}`
+      `https://duckduckgo.com/html/?q=${encodedQuery}`
     ];
 
     for (const searchUrl of searchUrls) {
-      const text = await fetchText(searchUrl, { timeout: 3000 });
+      const timeout = discoveryTimeout(deadline, DISCOVERY_SOURCE_TIMEOUT_MS);
+      if (!timeout) break;
+      const text = await fetchText(searchUrl, { timeout });
       if (!text) continue;
       const links = videoLinksFromText(text, "web");
       combined += `\n<!-- Melodify source: ${searchUrl} -->\n${text}\n${links.html}`;
@@ -391,6 +404,13 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
 
   if (successCount > 0 || noKey.count > 0 || reader.count > 0) sendResponse(res, 200, "OK", "text/html; charset=utf-8", combined, headOnly);
   else sendText(res, 502, "Bad Gateway", "Discovery unavailable.", headOnly);
+}
+
+function discoveryTimeout(deadline, preferredTimeout) {
+  if (!deadline) return preferredTimeout;
+  const remaining = deadline - Date.now();
+  if (remaining < 400) return 0;
+  return Math.min(preferredTimeout, remaining);
 }
 
 async function sendStatic(res, url, headOnly) {
