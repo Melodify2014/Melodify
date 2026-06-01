@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b0d0c">
+    <meta name="referrer" content="strict-origin-when-cross-origin">
+    <title>Melodify</title>
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Melodify navigation">
+        <a class="brand" href="#home" aria-label="Melodify home">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span>Melodify</span>
+        </a>
+
+        <nav class="nav-stack">
+          <a class="nav-item" href="#home" data-nav="home">
+            <span data-icon="home" aria-hidden="true"></span>
+            <span>Home</span>
+          </a>
+          <a class="nav-item" href="#liked" data-nav="liked">
+            <span data-icon="heart" aria-hidden="true"></span>
+            <span>Liked videos</span>
+            <span class="nav-count" id="likedCount">0</span>
+          </a>
+          <a class="nav-item" href="#following" data-nav="following">
+            <span data-icon="users" aria-hidden="true"></span>
+            <span>Following</span>
+            <span class="nav-count" id="followCount">0</span>
+          </a>
+          <a class="nav-item" href="#recommended" data-nav="recommended">
+            <span data-icon="sparkles" aria-hidden="true"></span>
+            <span>Recommended</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <p class="source-note">YouTube RSS cache</p>
+        </div>
+      </aside>
+
+      <div class="content-shell">
+        <header class="topbar">
+          <form class="search-form" id="searchForm" role="search">
+            <label class="search-box" for="searchInput">
+              <span data-icon="search" aria-hidden="true"></span>
+              <input id="searchInput" name="q" type="search" autocomplete="off" placeholder="Search music videos or creators">
+            </label>
+            <div class="segmented" role="group" aria-label="Search type">
+              <button type="button" class="segment active" data-filter="all">All</button>
+              <button type="button" class="segment" data-filter="videos">Videos</button>
+              <button type="button" class="segment" data-filter="channels">Creators</button>
+            </div>
+          </form>
+        </header>
+
+        <main class="view" id="view" tabindex="-1"></main>
+      </div>
+    </div>
+
+    <footer class="playerbar" aria-label="Player">
+      <section class="track-panel">
+        <div class="track-art" id="trackArt" aria-hidden="true"></div>
+        <div class="track-copy">
+          <p class="eyebrow" id="playerSource">Ready</p>
+          <h2 id="playerTitle">Choose a music video</h2>
+          <button class="link-button" type="button" id="playerChannel" data-action="current-channel" disabled>Melodify</button>
+        </div>
+      </section>
+
+      <section class="control-panel" aria-label="Playback controls">
+        <button class="icon-button" type="button" data-action="previous" aria-label="Previous" title="Previous">
+          <span data-icon="previous" aria-hidden="true"></span>
+        </button>
+        <button class="play-button" type="button" data-action="toggle-play" aria-label="Play" title="Play">
+          <span id="playButtonIcon" data-icon="play" aria-hidden="true"></span>
+        </button>
+        <button class="icon-button" type="button" data-action="next" aria-label="Next" title="Next">
+          <span data-icon="next" aria-hidden="true"></span>
+        </button>
+        <button class="icon-button" type="button" id="loopButton" data-action="toggle-loop" aria-label="Loop" title="Loop">
+          <span data-icon="loop" aria-hidden="true"></span>
+        </button>
+        <button class="pill-action" type="button" id="playerLike" data-action="current-like" disabled>
+          <span data-icon="heart" aria-hidden="true"></span>
+          <span>Like</span>
+        </button>
+        <button class="pill-action" type="button" id="playerSubscribe" data-action="current-subscribe" disabled>
+          <span data-icon="user-plus" aria-hidden="true"></span>
+          <span>Subscribe</span>
+        </button>
+        <a class="icon-button" id="youtubeLink" href="https://www.youtube.com" target="_blank" rel="noreferrer" aria-label="Open on YouTube" title="Open on YouTube">
+          <span data-icon="external" aria-hidden="true"></span>
+        </a>
+      </section>
+
+      <section class="youtube-panel" aria-label="YouTube player">
+        <div class="youtube-frame">
+          <div id="youtube-player"></div>
+          <div class="empty-player" id="emptyPlayer">
+            <span data-icon="music" aria-hidden="true"></span>
+          </div>
+        </div>
+      </section>
+    </footer>
+
+    <div class="modal-root" id="modalRoot" hidden></div>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <script src="https://www.youtube.com/iframe_api" async></script>
+    <script src="app.js" defer></script>
+  </body>
+</html>
