@@ -21,6 +21,10 @@ const SEARCH_DISCOVERY_TIMEOUT_MS = 12000;
 const VIDEO_IMPORT_CONCURRENCY = 6;
 const VIDEO_SEARCH_IMPORT_LIMIT = 24;
 const CHANNEL_DISCOVERY_IMPORT_LIMIT = 220;
+const RECOMMENDATION_DISCOVERY_QUERY_LIMIT = 5;
+const RECOMMENDATION_CHANNEL_QUERY_LIMIT = 4;
+const RECOMMENDATION_IMPORT_LIMIT = 16;
+const WATCH_HISTORY_LIMIT = 1200;
 const AVAILABILITY_MODEL_VERSION = 2;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
@@ -216,6 +220,7 @@ const state = {
   route: "home",
   activeChannelId: "",
   likedVideos: {},
+  watchedVideos: {},
   followedChannels: {},
   currentVideo: null,
   queue: [],
@@ -236,6 +241,7 @@ const state = {
   unavailableVideos: {},
   sessionBlockedVideos: {},
   recommendations: [],
+  recommendedChannels: [],
   loading: false,
   error: ""
 };
@@ -318,6 +324,7 @@ function hydrateState() {
   try {
     const saved = JSON.parse(localStorage.getItem(STATE_STORAGE) || "{}");
     state.likedVideos = saved.likedVideos || {};
+    state.watchedVideos = saved.watchedVideos || {};
     state.followedChannels = saved.followedChannels || {};
     state.currentVideo = saved.currentVideo || null;
     state.loop = Boolean(saved.loop);
@@ -331,6 +338,7 @@ function hydrateState() {
     state.creatorIndex = saved.creatorIndex || {};
     state.searchCache = saved.searchCache || {};
     state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
+    state.recommendedChannels = saved.recommendedChannels || [];
     state.unavailableVideos = saved.availabilityModelVersion === AVAILABILITY_MODEL_VERSION ? saved.unavailableVideos || {} : {};
     if (saved.availabilityModelVersion !== AVAILABILITY_MODEL_VERSION) {
       reEnableCachedVideos();
@@ -347,6 +355,7 @@ function persist() {
       STATE_STORAGE,
       JSON.stringify({
         likedVideos: state.likedVideos,
+        watchedVideos: compactWatchedVideos(state.watchedVideos),
         followedChannels: state.followedChannels,
         currentVideo: state.currentVideo,
         loop: state.loop,
@@ -360,6 +369,7 @@ function persist() {
         creatorIndex: state.creatorIndex,
         searchCache: state.searchCache,
         dailyPlaylists: state.dailyPlaylists,
+        recommendedChannels: state.recommendedChannels.slice(0, 16),
         unavailableVideos: state.unavailableVideos,
         availabilityModelVersion: AVAILABILITY_MODEL_VERSION
       })
@@ -667,11 +677,18 @@ function renderFollowingView() {
 function renderRecommendedView() {
   const playlists = getRenderedDailyPlaylists();
   const videos = playlists.flatMap((playlist) => playlist.videos);
+  const channels = getRenderedRecommendedChannels();
   lastVisibleVideos = videos;
+  const playlistHtml = playlists.length
+    ? playlists.map(renderDailyPlaylist).join("")
+    : renderEmpty("No unwatched recommendations yet", "Refresh after watching more music videos or following more creators.", "sparkles");
+  const channelHtml = channels.length
+    ? `<section><h2 class="section-title">New creators</h2>${renderChannelList(channels)}</section>`
+    : "";
   return `
     <header class="view-header">
       <div>
-        <p class="eyebrow">${state.dailyPlaylists.date === todayKey() ? "Daily playlists" : "Local profile ranking"}</p>
+        <p class="eyebrow">${state.dailyPlaylists.date === todayKey() ? "AI profile recommendations" : "Local profile ranking"}</p>
         <h1 class="view-title">Recommended</h1>
       </div>
       <button class="secondary-button" type="button" data-action="refresh-recommendations">
@@ -679,7 +696,8 @@ function renderRecommendedView() {
         <span>Refresh</span>
       </button>
     </header>
-    ${state.loading ? renderSkeletonGrid() : playlists.map(renderDailyPlaylist).join("")}
+    ${state.loading && !videos.length ? renderSkeletonGrid() : playlistHtml}
+    ${state.loading && !channels.length ? "" : channelHtml}
   `;
 }
 
@@ -1015,7 +1033,8 @@ async function expandDiscoveredChannels(channels) {
   return uniqueVideos(videos);
 }
 
-async function discoverVideos(query) {
+async function discoverVideos(query, options = {}) {
+  const { limit = VIDEO_SEARCH_IMPORT_LIMIT, enforceIntent = true } = options;
   const responses = await Promise.allSettled([
     fetchDiscoveryText(query, "videos"),
     fetchDiscoveryText(query, "shorts")
@@ -1023,7 +1042,8 @@ async function discoverVideos(query) {
   const texts = responses.filter((result) => result.status === "fulfilled").map((result) => result.value);
   if (!texts.length) throw responses.find((result) => result.status === "rejected")?.reason || new Error("Discovery unavailable");
   const urls = uniqueStrings(texts.flatMap(extractYoutubeVideoUrls));
-  const imported = await importVideosFromUrls(urls, { query, limit: VIDEO_SEARCH_IMPORT_LIMIT });
+  const imported = await importVideosFromUrls(urls, { query, limit, enforceIntent });
+  if (!enforceIntent) return rankVideos(imported);
   return rankSearchVideos(imported, query);
 }
 
@@ -1259,6 +1279,7 @@ async function importVideoFromUrl(value, options = {}) {
     cacheVideo(video, "oembed", false);
     cacheChannelVideos(channel.id, [video], false, { markFetched: false });
     state.recommendations = [];
+    state.recommendedChannels = [];
     state.dailyPlaylists = { date: "", playlists: [] };
     persist();
 
@@ -1431,6 +1452,7 @@ async function expandChannelDiscovery(channelId, force) {
     state.channelDiscoveryFetchedAt[channelId] = Date.now();
     if (imported.length) {
       state.recommendations = [];
+      state.recommendedChannels = [];
       state.dailyPlaylists = { date: "", playlists: [] };
     }
     persist();
@@ -1452,26 +1474,211 @@ async function loadRecommendations(force) {
   state.loading = true;
   render();
 
-  const matrix = getMetadataMatrix();
-  const allCached = rankVideos([...Object.values(state.videoCache), ...Object.values(state.likedVideos), ...demoVideos]);
-  const likedRanked = rankVideos([...Object.values(state.likedVideos), ...allCached]);
-  const followingRanked = rankVideos(allCached.filter((video) => isFollowing(video.channelId)));
-  const profileRanked = rankVideos(allCached.filter((video) => !isLiked(video.id)));
-  const terms = topMatrixTerms(matrix, 3);
-  const theme = terms.length ? terms.join(", ") : "cached likes and follows";
+  const profile = buildRecommendationProfile();
+  let discovered = { videos: [], channels: [] };
+  if (!isFileMode()) {
+    try {
+      discovered = await discoverAiRecommendationCandidates(profile);
+    } catch {
+      discovered = { videos: [], channels: [] };
+    }
+  }
 
-  const playlists = [
-    { id: "daily-cache", title: "Daily Cache Mix", query: `Related to ${theme}`, videoIds: profileRanked.slice(0, 14).map((video) => video.id) },
-    { id: "liked-radio", title: "Liked Radio", query: "Built from your liked videos", videoIds: likedRanked.slice(0, 14).map((video) => video.id) },
-    { id: "following-finds", title: "Following Finds", query: "Built from followed channel cache", videoIds: (followingRanked.length ? followingRanked : profileRanked).slice(0, 14).map((video) => video.id) }
-  ];
+  const playlists = buildRecommendationPlaylists(profile, discovered.videos);
+  const playlistVideos = uniqueVideos(playlists.flatMap((playlist) => playlist.videoIds.map((id) => state.videoCache[id]).filter(Boolean)));
+  const recommendedChannels = rankRecommendedChannels([...discovered.channels, ...deriveChannelsFromVideos([...discovered.videos, ...playlistVideos], "")], [...discovered.videos, ...playlistVideos]);
 
   state.dailyPlaylists = { date: today, playlists };
-  state.recommendations = getRenderedDailyPlaylists().flatMap((playlist) => playlist.videos).slice(0, 36);
+  state.recommendations = playlistVideos.slice(0, 42);
+  state.recommendedChannels = recommendedChannels.slice(0, 12);
   cacheVideos(state.recommendations, "recommendations", false);
+  cacheChannels(state.recommendedChannels, "recommendations", false);
   persist();
   state.loading = false;
   render();
+  if (force) showToast(state.recommendations.length ? "Recommended refreshed with new unwatched music." : "No new unwatched music found yet.");
+}
+
+function buildRecommendationProfile() {
+  const followedChannels = Object.values(state.followedChannels);
+  const followedVideos = uniqueVideos(followedChannels.flatMap((channel) => channelVideos(channel.id))).filter(isLikelyMusicVideo);
+  const likedVideos = Object.values(state.likedVideos).filter(isLikelyMusicVideo);
+  const cachedVideos = Object.values(state.videoCache).filter(isLikelyMusicVideo);
+  const seedVideos = uniqueVideos([...followedVideos, ...likedVideos, ...cachedVideos, ...demoVideos]);
+  const matrix = getMetadataMatrix();
+  const matrixTerms = topMatrixTerms(matrix, 12).filter(isUsefulRecommendationTerm);
+  const weightedTerms = topProfileTerms(seedVideos, 12).filter(isUsefulRecommendationTerm);
+  const genres = recommendationGenreTerms(seedVideos, [...matrixTerms, ...weightedTerms]).slice(0, 5);
+  const terms = uniqueStrings([...genres, ...matrixTerms, ...weightedTerms]).slice(0, 8);
+  const creators = followedChannels.length
+    ? followedChannels
+    : uniqueChannels(seedVideos.map(channelFromVideo)).slice(0, 5);
+  const title = terms.slice(0, 3).join(", ") || "music";
+  return { creators: creators.slice(0, 6), genres, terms, title, seedVideos };
+}
+
+async function discoverAiRecommendationCandidates(profile) {
+  const videoQueries = recommendationVideoQueries(profile).slice(0, RECOMMENDATION_DISCOVERY_QUERY_LIMIT);
+  const videoResults = await Promise.allSettled(
+    videoQueries.map((query) => discoverVideos(query, { limit: RECOMMENDATION_IMPORT_LIMIT, enforceIntent: false }))
+  );
+  const videos = rankRecommendationVideos(videoResults.flatMap((result) => result.status === "fulfilled" ? result.value : []));
+  cacheVideos(videos, "ai-recommendations", false);
+
+  const channelQueries = recommendationChannelQueries(profile).slice(0, RECOMMENDATION_CHANNEL_QUERY_LIMIT);
+  const channelResults = await Promise.allSettled(
+    channelQueries.map((query) => discoverChannels(query, { limit: 3, candidateVideos: videos, skipVideoFallback: false }))
+  );
+  const channels = uniqueChannels([
+    ...channelResults.flatMap((result) => result.status === "fulfilled" ? result.value : []),
+    ...videos.map(channelFromVideo)
+  ]);
+  cacheChannels(channels, "ai-recommendations", false);
+  return { videos, channels };
+}
+
+function recommendationVideoQueries(profile) {
+  const queries = [];
+  const primaryGenres = profile.genres.slice(0, 3);
+  const primaryTerms = profile.terms.filter((term) => !primaryGenres.includes(term)).slice(0, 4);
+  const primaryCreators = profile.creators.slice(0, 3);
+
+  for (const genre of primaryGenres) {
+    queries.push(`${genre} music videos`);
+    queries.push(`new ${genre} songs official audio`);
+  }
+  if (primaryTerms.length) queries.push(`${primaryTerms.slice(0, 3).join(" ")} music videos`);
+  for (const creator of primaryCreators) {
+    const name = cleanRecommendationPhrase(creator.title);
+    if (!name) continue;
+    const genre = primaryGenres[0] || "music";
+    queries.push(`artists like ${name} ${genre} music`);
+    queries.push(`similar to ${name} music videos`);
+  }
+  queries.push("new music videos official audio");
+  return uniqueStrings(queries.map(limitDiscoveryQuery));
+}
+
+function recommendationChannelQueries(profile) {
+  const queries = [];
+  const primaryGenres = profile.genres.slice(0, 3);
+  const primaryCreators = profile.creators.slice(0, 3);
+  for (const genre of primaryGenres) {
+    queries.push(`${genre} music channels`);
+    queries.push(`${genre} artists YouTube channels`);
+  }
+  for (const creator of primaryCreators) {
+    const name = cleanRecommendationPhrase(creator.title);
+    if (name) queries.push(`channels like ${name} music`);
+  }
+  if (profile.terms.length) queries.push(`${profile.terms.slice(0, 3).join(" ")} music channels`);
+  return uniqueStrings(queries.map(limitDiscoveryQuery));
+}
+
+function buildRecommendationPlaylists(profile, discoveredVideos = []) {
+  const pool = uniqueVideos([
+    ...discoveredVideos,
+    ...Object.values(state.videoCache),
+    ...state.searchResults.videos,
+    ...demoVideos
+  ]);
+  const ranked = rankRecommendationVideos(pool);
+  const newCreatorVideos = ranked.filter((video) => !isFollowing(video.channelId));
+  const followingVideos = ranked.filter((video) => isFollowing(video.channelId));
+  const likedSeedVideos = Object.values(state.likedVideos);
+  const likedRelated = rankRecommendationVideos(ranked.filter((video) => {
+    if (!likedSeedVideos.length) return true;
+    return likedSeedVideos.some((liked) => video.channelId === liked.channelId || sharedRecommendationTerms(video, liked) >= 2);
+  }));
+  const theme = profile.title || "your follows";
+  return [
+    { id: "ai-discovery", title: "AI Discovery", query: `Searched around ${theme}`, videoIds: newCreatorVideos.slice(0, 14).map((video) => video.id) },
+    { id: "liked-radio", title: "Liked Radio", query: "Related unwatched music", videoIds: likedRelated.slice(0, 14).map((video) => video.id) },
+    { id: "following-finds", title: "Following Finds", query: "Unwatched from followed creators", videoIds: (followingVideos.length ? followingVideos : ranked).slice(0, 14).map((video) => video.id) }
+  ].map((playlist) => ({ ...playlist, videoIds: uniqueStrings(playlist.videoIds).filter((id) => state.videoCache[id] && isRecommendationVideo(state.videoCache[id])) }))
+    .filter((playlist) => playlist.videoIds.length);
+}
+
+function getRenderedRecommendedChannels() {
+  const playlistVideos = getRenderedDailyPlaylists().flatMap((playlist) => playlist.videos);
+  const channels = uniqueChannels([
+    ...(state.recommendedChannels || []),
+    ...deriveChannelsFromVideos([...state.recommendations, ...playlistVideos], "")
+  ]);
+  return rankRecommendedChannels(channels, playlistVideos).slice(0, 12);
+}
+
+function rankRecommendedChannels(channels, videos = []) {
+  const matrix = getMetadataMatrix();
+  const videosByChannel = new Map();
+  for (const video of videos || []) {
+    if (!video?.channelId) continue;
+    videosByChannel.set(video.channelId, (videosByChannel.get(video.channelId) || 0) + 1);
+  }
+  return uniqueChannels(channels)
+    .filter((channel) => channel?.id && !isFollowing(channel.id) && !String(channel.id).startsWith("demo-"))
+    .map((channel) => {
+      const row = matrix.channelById.get(channel.id);
+      const profileScore = row ? dotVectors(row.vector, matrix.profileVector) * 100 : 0;
+      const videoBoost = Math.min(40, (videosByChannel.get(channel.id) || channelVideos(channel.id).length) * 8);
+      const genreBoost = recommendationGenreTerms([], [searchable(channel)]).length ? 12 : 0;
+      return { channel, score: profileScore + videoBoost + genreBoost + queryMatchScore(channel, channel.title || "") };
+    })
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.channel);
+}
+
+function rankRecommendationVideos(videos) {
+  return rankVideos(videos).filter(isRecommendationVideo);
+}
+
+function isRecommendationVideo(video) {
+  return Boolean(video?.id) && isPlayableVideo(video) && isLikelyMusicVideo(video) && !isWatched(video.id) && !isLiked(video.id);
+}
+
+function recommendationGenreTerms(videos, extraTexts = []) {
+  const weights = new Map();
+  for (const video of videos || []) {
+    const text = searchable(video);
+    for (const term of allGenreTerms()) {
+      if (tokenInText(term, text)) weights.set(term, (weights.get(term) || 0) + 2);
+    }
+  }
+  for (const text of extraTexts || []) {
+    for (const term of allGenreTerms()) {
+      if (tokenInText(term, text)) weights.set(term, (weights.get(term) || 0) + 1);
+    }
+  }
+  return [...weights.entries()].sort((a, b) => b[1] - a[1]).map(([term]) => term);
+}
+
+function sharedRecommendationTerms(a, b) {
+  const aTerms = new Set(tokenize(`${a.title || ""} ${a.channelTitle || ""} ${(a.tags || []).join(" ")}`));
+  const bTerms = new Set(tokenize(`${b.title || ""} ${b.channelTitle || ""} ${(b.tags || []).join(" ")}`));
+  let shared = 0;
+  for (const term of aTerms) if (bTerms.has(term)) shared += 1;
+  return shared;
+}
+
+function isUsefulRecommendationTerm(term) {
+  const value = String(term || "").toLowerCase();
+  if (value.length < 3 || value.includes(":")) return false;
+  return ![
+    "youtube", "creator", "official", "video", "music", "song", "audio", "channel",
+    "rss", "oembed", "shorts", "watch", "com", "www"
+  ].includes(value);
+}
+
+function cleanRecommendationPhrase(value) {
+  return String(value || "")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\w\s@.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function limitDiscoveryQuery(query) {
+  return cleanRecommendationPhrase(query).slice(0, 110).trim();
 }
 
 function getRenderedDailyPlaylists() {
@@ -1480,7 +1687,7 @@ function getRenderedDailyPlaylists() {
     return playlists
       .map((playlist) => ({
         ...playlist,
-        videos: (playlist.videoIds || []).map((id) => state.videoCache[id]).filter(isPlayableVideo)
+        videos: (playlist.videoIds || []).map((id) => state.videoCache[id]).filter(isRecommendationVideo)
       }))
       .filter((playlist) => playlist.videos.length);
   }
@@ -1596,6 +1803,7 @@ async function refreshChannelFeed(channelId, options = {}) {
     state.channelCache[channelId] = { channel, videos, nextPageToken: "", loading: false };
     state.channelFeedErrors[channelId] = "";
     state.recommendations = [];
+    state.recommendedChannels = [];
     state.dailyPlaylists = { date: "", playlists: [] };
     persist();
     return { channel, videos };
@@ -1881,6 +2089,7 @@ function primeCache() {
   cacheChannels(demoChannels, "demo", false);
   cacheVideos(demoVideos, "demo", false);
   cacheChannels(Object.values(state.followedChannels), "saved", false);
+  cacheChannels(state.recommendedChannels, "saved", false);
   cacheVideos(Object.values(state.likedVideos), "saved", false);
   cacheVideos(state.recommendations, "saved", false);
   for (const channel of Object.values(state.cachedChannels)) rememberCreatorQuery(channel.title, channel);
@@ -2111,8 +2320,10 @@ async function playVideo(video, queue) {
 
   playerBlocked = false;
   state.currentVideo = video;
+  const removedRecommendation = markWatched(video, false);
   persist();
-  renderPlayer();
+  if (removedRecommendation && state.route === "recommended") render();
+  else renderPlayer();
   ensurePlayer();
 
   if (ytPlayer && playerReady) {
@@ -2315,6 +2526,7 @@ function toggleLike(video) {
     state.likedVideos[video.id] = video;
   }
   state.recommendations = [];
+  state.recommendedChannels = [];
   state.dailyPlaylists = { date: "", playlists: [] };
   persist();
   render();
@@ -2329,6 +2541,7 @@ function toggleFollow(channel) {
     state.followedChannels[channel.id] = channel;
   }
   state.recommendations = [];
+  state.recommendedChannels = [];
   state.dailyPlaylists = { date: "", playlists: [] };
   persist();
   render();
@@ -2362,6 +2575,7 @@ function findChannel(id) {
   return (
     state.searchResults.channels.find((channel) => channel.id === id) ||
     state.cachedChannels[id] ||
+    state.recommendedChannels.find((channel) => channel.id === id) ||
     Object.values(state.followedChannels).find((channel) => channel.id === id) ||
     Object.values(state.channelCache).map((cache) => cache.channel).find((channel) => channel?.id === id) ||
     demoChannels.find((channel) => channel.id === id) ||
@@ -2372,6 +2586,51 @@ function findChannel(id) {
 
 function isLiked(videoId) {
   return Boolean(state.likedVideos[videoId]);
+}
+
+function isWatched(videoId) {
+  return Boolean(state.watchedVideos[videoId]);
+}
+
+function markWatched(video, shouldPersist = true) {
+  if (!video?.id) return false;
+  state.watchedVideos[video.id] = {
+    id: video.id,
+    title: video.title || "",
+    channelId: video.channelId || "",
+    watchedAt: new Date().toISOString()
+  };
+  state.watchedVideos = compactWatchedVideos(state.watchedVideos);
+  const changed = removeVideoFromRecommendations(video.id);
+  if (changed) metadataMatrix = null;
+  if (shouldPersist) persist();
+  return changed;
+}
+
+function compactWatchedVideos(watched = {}) {
+  return Object.fromEntries(
+    Object.entries(watched || {})
+      .filter(([id]) => id)
+      .sort((a, b) => Date.parse(b[1]?.watchedAt || 0) - Date.parse(a[1]?.watchedAt || 0))
+      .slice(0, WATCH_HISTORY_LIMIT)
+  );
+}
+
+function removeVideoFromRecommendations(videoId) {
+  if (!videoId) return false;
+  let changed = false;
+  const beforeRecommendations = state.recommendations.length;
+  state.recommendations = state.recommendations.filter((video) => video?.id !== videoId);
+  changed = changed || state.recommendations.length !== beforeRecommendations;
+
+  const playlists = (state.dailyPlaylists.playlists || []).map((playlist) => {
+    const videoIds = (playlist.videoIds || []).filter((id) => id !== videoId);
+    if (videoIds.length !== (playlist.videoIds || []).length) changed = true;
+    return { ...playlist, videoIds };
+  }).filter((playlist) => playlist.videoIds.length);
+  if (playlists.length !== (state.dailyPlaylists.playlists || []).length) changed = true;
+  state.dailyPlaylists = { ...state.dailyPlaylists, playlists };
+  return changed;
 }
 
 function isFollowing(channelId) {
@@ -2388,8 +2647,9 @@ function isPlayableVideo(video) {
 
 function getLocalRecommendations() {
   const pool = uniqueVideos([...demoVideos, ...Object.values(state.videoCache), ...Object.values(state.likedVideos), ...state.searchResults.videos]);
-  const ranked = rankVideos(pool).filter((video) => !isLiked(video.id));
-  return ranked.length ? ranked : demoVideos;
+  const ranked = rankRecommendationVideos(pool);
+  const fallback = demoVideos.filter(isRecommendationVideo);
+  return ranked.length ? ranked : fallback;
 }
 
 function rankVideos(videos) {
