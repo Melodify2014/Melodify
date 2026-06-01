@@ -566,9 +566,6 @@ function renderSearchView() {
 
   const { videos, channels } = state.searchResults;
   const title = state.query ? `Search: ${escapeHtml(state.query)}` : "Search";
-  const searchAction = state.query
-    ? `<button class="secondary-button" type="button" data-action="force-search"><span data-icon="search" aria-hidden="true"></span><span>Search web</span></button>`
-    : "";
 
   if (!videos.length && !channels.length) {
     return `
@@ -577,7 +574,6 @@ function renderSearchView() {
           <p class="eyebrow">Web + cache</p>
           <h1 class="view-title">${title}</h1>
         </div>
-        ${searchAction}
       </header>
       ${renderEmpty("No results found", "Melodify could not discover matching music videos yet.", "search")}
     `;
@@ -597,7 +593,6 @@ function renderSearchView() {
         <p class="eyebrow">Web + cache</p>
         <h1 class="view-title">${title}</h1>
       </div>
-      ${searchAction}
     </header>
     ${channelSection}
     ${videoSection}
@@ -903,17 +898,8 @@ async function runSearch(query, filter, options = {}) {
     return;
   }
 
-  const cached = getCachedSearchEntry(query, filter);
-  if (cached && !force) {
-    state.searchResults = cached;
-    state.error = "";
-    state.loading = false;
-    render();
-    showToast("Loaded from Melodify cache.");
-    return;
-  }
-
-  const local = cachedSearch(query, filter);
+  const cached = getCachedSearchEntry(query, filter) || { videos: [], channels: [] };
+  const local = mergeSearchResults(cached, cachedSearch(query, filter));
   const hasLocalResults = Boolean(local.videos.length || local.channels.length);
   if (!force && hasLocalResults) {
     state.searchResults = local;
