@@ -11,6 +11,7 @@ const PLAYER_UNAVAILABLE_ERRORS = new Set([2, 5, 100, 101, 150]);
 const SEARCH_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHANNEL_CACHE_TTL_MS = 60 * 60 * 1000;
 const FOLLOWED_CHANNEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const CHANNEL_PAGE_AUTO_REFRESH_RETRY_MS = 2 * 60 * 1000;
 const APP_UPDATE_CHECK_INTERVAL_MS = 15000;
 const APP_UPDATE_RELOAD_DELAY_MS = 1200;
 const APP_UPDATE_SERVER_RELOAD_DELAY_MS = 3200;
@@ -223,7 +224,7 @@ let appVersionSignature = "";
 let appServerVersionSignature = "";
 let appUpdateInProgress = false;
 let followedChannelRefreshInFlight = false;
-const channelAutoLoadRequests = new Set();
+const channelAutoLoadRequests = new Map();
 
 const els = {};
 
@@ -839,10 +840,9 @@ async function maybeLoadRouteData() {
   if (
     state.route === "channel" &&
     state.activeChannelId &&
-    !activeCache?.loading &&
-    !channelAutoLoadRequests.has(state.activeChannelId)
+    shouldAutoLoadChannelPage(state.activeChannelId, activeCache)
   ) {
-    channelAutoLoadRequests.add(state.activeChannelId);
+    channelAutoLoadRequests.set(state.activeChannelId, Date.now());
     await loadChannelVideos(state.activeChannelId, true);
   }
 
@@ -853,6 +853,14 @@ async function maybeLoadRouteData() {
   if (state.route === "following" || state.route === "recommended") {
     refreshFollowedChannelsCache(false);
   }
+}
+
+function shouldAutoLoadChannelPage(channelId, activeCache) {
+  if (!channelId || activeCache?.loading) return false;
+  const lastAttemptAt = Number(channelAutoLoadRequests.get(channelId) || 0);
+  if (Date.now() - lastAttemptAt < CHANNEL_PAGE_AUTO_REFRESH_RETRY_MS) return false;
+  const cachedVideos = uniqueVideos([...(activeCache?.videos || []), ...channelVideos(channelId)]).filter(isLikelyMusicVideo);
+  return !cachedVideos.length || shouldRefreshChannel(channelId) || shouldDiscoverChannel(channelId);
 }
 
 async function runSearch(query, filter, options = {}) {

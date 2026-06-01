@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "melodify-static-v24";
+const CACHE_NAME = "melodify-static-v25";
 const APP_SHELL = [
   "./",
   "./index.html",
