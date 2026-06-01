@@ -9,7 +9,8 @@ const APP_RESTART_PATH = "/__melodify/restart";
 const MUSIC_CATEGORY_ID = "10";
 const PLAYER_UNAVAILABLE_ERRORS = new Set([2, 5, 100, 101, 150]);
 const SEARCH_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const CHANNEL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CHANNEL_CACHE_TTL_MS = 60 * 60 * 1000;
+const FOLLOWED_CHANNEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const APP_UPDATE_CHECK_INTERVAL_MS = 15000;
 const APP_UPDATE_RELOAD_DELAY_MS = 1200;
 const APP_UPDATE_SERVER_RELOAD_DELAY_MS = 3200;
@@ -18,7 +19,7 @@ const LOCAL_PLAYER_HELP = "Open Melodify from the Desktop or Start Menu shortcut
 const SEARCH_DISCOVERY_TIMEOUT_MS = 12000;
 const VIDEO_IMPORT_CONCURRENCY = 6;
 const VIDEO_SEARCH_IMPORT_LIMIT = 24;
-const CHANNEL_DISCOVERY_IMPORT_LIMIT = 140;
+const CHANNEL_DISCOVERY_IMPORT_LIMIT = 220;
 const AVAILABILITY_MODEL_VERSION = 2;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
@@ -221,6 +222,7 @@ let toastTimer = 0;
 let appVersionSignature = "";
 let appServerVersionSignature = "";
 let appUpdateInProgress = false;
+let followedChannelRefreshInFlight = false;
 const channelAutoLoadRequests = new Set();
 
 const els = {};
@@ -244,6 +246,7 @@ function init() {
   render();
   registerServiceWorker();
   startAppUpdateWatcher();
+  startFollowedChannelRefreshWatcher();
 
   if (window.YT && window.YT.Player) {
     ytReady = true;
@@ -410,7 +413,7 @@ async function handleAction(action, target, event) {
     const channel = findChannel(target.dataset.channelId);
     if (channel) {
       toggleFollow(channel);
-      if (isFollowing(channel.id)) await refreshChannelFeed(channel.id, { force: false, quiet: true });
+      if (isFollowing(channel.id)) await refreshChannelLibrary(channel.id, { force: true, quiet: true });
     }
     return;
   }
@@ -474,7 +477,7 @@ async function handleAction(action, target, event) {
   if (action === "current-subscribe" && state.currentVideo) {
     const channel = channelFromVideo(state.currentVideo);
     toggleFollow(channel);
-    if (isFollowing(channel.id)) await refreshChannelFeed(channel.id, { force: false, quiet: true });
+    if (isFollowing(channel.id)) await refreshChannelLibrary(channel.id, { force: true, quiet: true });
     return;
   }
 
@@ -579,7 +582,7 @@ function renderSearchView() {
     `;
   }
 
-  const channelSection = channels.length && state.filter !== "videos"
+  const channelSection = channels.length && (state.filter !== "videos" || !videos.length)
     ? `<section><h2 class="section-title">Creators</h2>${renderChannelList(channels)}</section>`
     : "";
   const videoSection = videos.length && state.filter !== "channels"
@@ -666,7 +669,7 @@ function renderChannelView() {
   lastVisibleVideos = videos;
   const showSkeleton = cache?.loading && !allVideos.length;
   const feedStatus = channelFeedStatus(channel.id);
-  const feedBadgeClass = feedStatus === "Updated today" ? "green" : feedStatus === "Feed unavailable" ? "amber" : "";
+  const feedBadgeClass = feedStatus === "Updated this hour" ? "green" : feedStatus === "Feed unavailable" ? "amber" : "";
 
   const action = isFollowing(channel.id)
     ? `<button class="pill-action active" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}"><span data-icon="check" aria-hidden="true"></span><span>Subscribed</span></button>`
@@ -875,12 +878,11 @@ async function runSearch(query, filter, options = {}) {
     state.error = "";
     render();
     try {
-      const result = await refreshChannelFeed(channelFromInput, { force: true, quiet: true, throwOnError: true });
-      await expandChannelDiscovery(channelFromInput, true);
+      const result = await refreshChannelLibrary(channelFromInput, { force: true, quiet: true, throwOnError: true });
       const videos = channelVideos(channelFromInput);
       state.searchResults = {
         videos: filter === "channels" ? [] : videos,
-        channels: filter === "videos" ? [] : [result.channel]
+        channels: filter === "videos" && videos.length ? [] : [result.channel].filter(Boolean)
       };
       writeSearchCache(query, filter, state.searchResults);
     } catch (error) {
@@ -957,28 +959,35 @@ function mergeSearchResults(a, b) {
 async function discoverSearch(query, filter) {
   const imported = filter !== "channels" ? await discoverVideos(query) : [];
   let discoveredChannels = [];
-  if (filter !== "videos" || !imported.length) {
+  if (filter !== "videos" || !imported.length || shouldSearchCreatorsForQuery(query)) {
     try {
-      discoveredChannels = await discoverChannels(query, { limit: filter === "channels" ? 4 : 2, followFirst: false, candidateVideos: imported, skipVideoFallback: filter !== "channels" && !imported.length });
+      discoveredChannels = await discoverChannels(query, { limit: filter === "channels" ? 4 : 2, followFirst: false, candidateVideos: imported, skipVideoFallback: false });
     } catch (error) {
       if (filter === "channels" || !imported.length) throw error;
     }
   }
-  const expanded = filter !== "channels" && !imported.length ? await expandDiscoveredChannels(discoveredChannels) : [];
+  const creatorMatchedChannels = discoveredChannels.filter((channel) => creatorMatchesQuery(channel, query));
+  const expanded = filter !== "channels" && (!imported.length || creatorMatchedChannels.length)
+    ? await expandDiscoveredChannels(creatorMatchedChannels.length ? creatorMatchedChannels : discoveredChannels)
+    : [];
   const indexedChannelVideos = filter !== "channels" ? videosFromCreatorIndex(query) : [];
+  const followedChannelVideos = filter !== "channels" ? videosFromFollowedChannels(query) : [];
   const discoveredChannelVideos = uniqueVideos([
+    ...followedChannelVideos,
     ...discoveredChannels.flatMap((channel) => channelVideos(channel.id)),
     ...expanded,
     ...indexedChannelVideos
   ]);
   const videos = filter !== "channels" ? rankSearchVideos([...imported, ...discoveredChannelVideos], query) : [];
-  const channels = filter !== "videos" ? filterChannelsForQuery([...discoveredChannels, ...deriveChannelsFromVideos(videos, query)], query, videos) : [];
+  const channels = filter !== "videos" || !videos.length
+    ? filterChannelsForQuery([...discoveredChannels, ...deriveChannelsFromVideos(videos, query)], query, videos)
+    : [];
   return { videos, channels };
 }
 
 async function expandDiscoveredChannels(channels) {
   const videos = [];
-  for (const channel of channels.slice(0, 1)) {
+  for (const channel of channels.slice(0, 2)) {
     videos.push(...await expandChannelDiscovery(channel.id, false));
   }
   return uniqueVideos(videos);
@@ -1358,8 +1367,7 @@ async function loadChannelVideos(channelId, append) {
   render();
 
   try {
-    await refreshChannelFeed(channelId, { force: true, quiet: append !== true });
-    await expandChannelDiscovery(channelId, append);
+    await refreshChannelLibrary(channelId, { force: true, quiet: append !== true });
   } finally {
     render();
   }
@@ -1483,13 +1491,37 @@ async function refreshFollowedChannelsCache(force) {
     if (force) showToast("Open Melodify from the Desktop or Start Menu shortcut to refresh channel feeds.");
     return;
   }
-  for (const channel of Object.values(state.followedChannels)) {
-    if (state.channelCache[channel.id]?.loading) continue;
-    if (!force && state.channelFeedErrors[channel.id]) continue;
-    if (!force && !shouldRefreshChannel(channel.id)) continue;
-    await refreshChannelFeed(channel.id, { force, quiet: !force });
+  if (followedChannelRefreshInFlight) return;
+  followedChannelRefreshInFlight = true;
+  try {
+    for (const channel of Object.values(state.followedChannels)) {
+      try {
+        if (state.channelCache[channel.id]?.loading) continue;
+        if (!force && !shouldRefreshChannel(channel.id) && !shouldDiscoverChannel(channel.id)) continue;
+        await refreshChannelLibrary(channel.id, { force, quiet: !force });
+      } catch {
+        // One flaky creator should not stop the rest of the followed refresh.
+      }
+    }
+  } finally {
+    followedChannelRefreshInFlight = false;
   }
   if (force) showToast("Followed channel feeds refreshed.");
+}
+
+async function refreshChannelLibrary(channelId, options = {}) {
+  const { force = false, quiet = false, throwOnError = false } = options;
+  let feedResult = null;
+  if (isRssChannelId(channelId)) {
+    feedResult = await refreshChannelFeed(channelId, { force, quiet, throwOnError });
+  }
+  if (force || shouldDiscoverChannel(channelId)) {
+    await expandChannelDiscovery(channelId, force);
+  }
+  return {
+    channel: findChannel(channelId) || feedResult?.channel || null,
+    videos: channelVideos(channelId)
+  };
 }
 
 async function refreshChannelFeed(channelId, options = {}) {
@@ -1656,7 +1688,7 @@ function channelFeedStatus(channelId) {
   if (state.channelFeedErrors[channelId]) return "Feed unavailable";
   const fetchedAt = Number(state.channelFetchedAt[channelId] || 0);
   if (!fetchedAt) return "Cached";
-  return new Date(fetchedAt).toLocaleDateString("en-CA") === todayKey() ? "Updated today" : "Cached";
+  return Date.now() - fetchedAt <= CHANNEL_CACHE_TTL_MS ? "Updated this hour" : "Cached";
 }
 
 function shouldDiscoverChannel(channelId) {
@@ -1666,12 +1698,19 @@ function shouldDiscoverChannel(channelId) {
 }
 
 function channelDiscoveryQuery(channel) {
-  return [channel.title, channel.url, channel.description]
+  const handle = channelHandle(channel);
+  return uniqueStrings([channel.title, handle].filter((item) => item && item !== "YouTube creator"))
     .filter(Boolean)
     .join(" ")
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/\s+/g, " ")
     .trim() || channel.id;
+}
+
+function channelHandle(channel) {
+  const source = `${channel?.url || ""} ${channel?.description || ""}`;
+  const handleMatch = source.match(/youtube\.com\/@([^/?#\s]+)/i) || source.match(/(^|\s)@([A-Za-z0-9._-]+)/);
+  return (handleMatch?.[2] || handleMatch?.[1] || "").replace(/^@/, "");
 }
 
 function videoBelongsToChannel(video, channel) {
@@ -1699,18 +1738,19 @@ function demoSearch(query, filter) {
 }
 
 function cachedSearch(query, filter) {
-  const text = query.toLowerCase();
   const matrix = getMetadataMatrix();
+  const followedVideos = filter !== "channels" ? videosFromFollowedChannels(query) : [];
   const indexedVideos = filter !== "channels" ? videosFromCreatorIndex(query) : [];
-  const matchedVideos = filter !== "channels" ? rankSearchVideos([...indexedVideos, ...searchMetadataRows(matrix.videoRows, query).map((row) => row.item)], query) : [];
-  const indexedChannels = filter !== "videos" ? channelsFromCreatorIndex(query) : [];
-  const matchedChannels = filter !== "videos" ? uniqueChannels([...indexedChannels, ...searchMetadataRows(matrix.channelRows, query).map((row) => row.item)]).filter((channel) => matchesSearchIntent(channel, query)) : [];
+  const matchedVideos = filter !== "channels" ? rankSearchVideos([...followedVideos, ...indexedVideos, ...searchMetadataRows(matrix.videoRows, query).map((row) => row.item)], query) : [];
+  const shouldIncludeChannels = filter !== "videos" || !matchedVideos.length;
+  const indexedChannels = shouldIncludeChannels ? channelsFromCreatorIndex(query) : [];
+  const matchedChannels = shouldIncludeChannels ? uniqueChannels([...indexedChannels, ...searchMetadataRows(matrix.channelRows, query).map((row) => row.item)]).filter((channel) => matchesSearchIntent(channel, query)) : [];
   const derivedChannels = deriveChannelsFromVideos(matchedVideos, query);
   return {
     videos: filter !== "channels"
       ? matchedVideos
       : [],
-    channels: filter !== "videos"
+    channels: shouldIncludeChannels
       ? filterChannelsForQuery([...matchedChannels, ...derivedChannels], query, matchedVideos).slice(0, 12)
       : []
   };
@@ -1776,6 +1816,32 @@ function channelsFromCreatorIndex(query) {
 
 function videosFromCreatorIndex(query) {
   return uniqueVideos(channelsFromCreatorIndex(query).flatMap((channel) => channelVideos(channel.id)));
+}
+
+function videosFromFollowedChannels(query) {
+  return uniqueVideos(Object.keys(state.followedChannels).flatMap((channelId) => channelVideos(channelId)))
+    .filter((video) => matchesSearchIntent(video, query));
+}
+
+function shouldSearchCreatorsForQuery(query) {
+  if (queryGenreTerms(query).length) return false;
+  const tokens = queryIntentTokens(query);
+  if (!tokens.length || tokens.length > 3) return false;
+  const text = String(query || "").toLowerCase();
+  if (hasTermSignal(text, MUSIC_SIGNAL_TERMS)) return false;
+  return true;
+}
+
+function creatorMatchesQuery(channel, query) {
+  if (!channel) return false;
+  const key = normalizeCreatorKey(query);
+  if (!key) return false;
+  const title = normalizeCreatorKey(channel.title);
+  const url = normalizeCreatorKey(channel.url || channel.description);
+  return Boolean(
+    (title && (title === key || title.includes(key) || key.includes(title))) ||
+    (url && url.includes(key))
+  );
 }
 
 function channelVideos(channelId) {
@@ -2623,9 +2689,21 @@ function searchable(item) {
 function rankSearchVideos(videos, query) {
   return uniqueVideos(videos)
     .filter((video) => isPlayableVideo(video) && isLikelyMusicVideo(video) && matchesSearchIntent(video, query))
-    .map((video) => ({ video, score: queryMatchScore(video, query) * 100 + scoreVideo(video) }))
+    .map((video) => ({ video, score: queryMatchScore(video, query) * 100 + searchPriorityBoost(video, query) + scoreVideo(video) }))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.video);
+}
+
+function searchPriorityBoost(video, query) {
+  let score = 0;
+  if (isFollowing(video.channelId)) score += 5000;
+  const title = String(video.title || "").toLowerCase();
+  const channel = String(video.channelTitle || "").toLowerCase();
+  const phrase = String(query || "").trim().toLowerCase();
+  if (phrase && title.includes(phrase)) score += 1200;
+  if (phrase && channel.includes(phrase)) score += 900;
+  if (isFollowing(video.channelId) && phrase && title.includes(phrase)) score += 2000;
+  return score;
 }
 
 function filterChannelsForQuery(channels, query, videos = []) {
@@ -2869,6 +2947,19 @@ function startAppUpdateWatcher() {
   window.setInterval(checkForUpdates, APP_UPDATE_CHECK_INTERVAL_MS);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) checkForUpdates();
+  });
+}
+
+function startFollowedChannelRefreshWatcher() {
+  if (isFileMode()) return;
+  const refresh = () => {
+    refreshFollowedChannelsCache(false).catch(() => {});
+  };
+
+  window.setTimeout(refresh, 15000);
+  window.setInterval(refresh, FOLLOWED_CHANNEL_REFRESH_INTERVAL_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refresh();
   });
 }
 

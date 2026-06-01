@@ -9,6 +9,7 @@ const ROOT = __dirname;
 const PORT = Number(process.env.PORT || 8788);
 const DISCOVERY_BUDGET_MS = 10000;
 const DISCOVERY_READER_TIMEOUT_MS = 4500;
+const DISCOVERY_CHANNEL_READER_TIMEOUT_MS = 2500;
 const DISCOVERY_SOURCE_TIMEOUT_MS = 2000;
 const VERSION_FILES = [
   "index.html",
@@ -234,8 +235,9 @@ function readerUrl(targetUrl) {
 async function readerYoutubeSearch(query, type, deadline) {
   let count = 0;
   let html = "";
-  for (const searchPhrase of searchPhrasesForQuery(query, type).slice(0, 2)) {
-    const timeout = discoveryTimeout(deadline, DISCOVERY_READER_TIMEOUT_MS);
+  const phrases = searchPhrasesForQuery(query, type).slice(0, type === "channels" ? 1 : 2);
+  for (const searchPhrase of phrases) {
+    const timeout = discoveryTimeout(deadline, type === "channels" ? DISCOVERY_CHANNEL_READER_TIMEOUT_MS : DISCOVERY_READER_TIMEOUT_MS);
     if (!timeout) break;
     const targetUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchPhrase).replace(/%20/g, "+")}`;
     const text = await fetchText(readerUrl(targetUrl), { timeout });
@@ -258,9 +260,9 @@ async function noKeyVideoSearch(query, type, deadline) {
 
   let html = "";
   let count = 0;
-  const targetCount = type === "channel-videos" ? 80 : type === "shorts" ? 60 : 30;
+  const targetCount = type === "channel-videos" ? 140 : type === "shorts" ? 60 : 30;
   const encodedQuery = encodeURIComponent(searchPhrasesForQuery(query, type)[0]);
-  const pages = type === "channel-videos" || type === "shorts" ? [1, 2] : [1];
+  const pages = type === "channel-videos" ? [1, 2, 3] : type === "shorts" ? [1, 2] : [1];
   const pipedUrls = pages.flatMap((page) => [
     `https://pipedapi.kavin.rocks/search?q=${encodedQuery}&filter=videos&page=${page}`,
     `https://pipedapi.adminforge.de/search?q=${encodedQuery}&filter=videos&page=${page}`
@@ -349,6 +351,8 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
     for (const genre of genreTerms.slice(0, 2)) searchQueries.push(`${genre} music shorts`);
   } else if (type === "channel-videos") {
     searchQueries.push(`site:youtube.com/watch ${query} music`);
+    searchQueries.push(`${query} YouTube channel uploads`);
+    searchQueries.push(`${query} YouTube channel videos`);
     searchQueries.push(`${query} YouTube music videos`);
     searchQueries.push(`${query} official music videos`);
     for (const genre of genreTerms.slice(0, 2)) searchQueries.push(`${genre} music videos`);
@@ -470,6 +474,9 @@ function searchPhrasesForQuery(query, type) {
     phraseGenres.forEach((genre) => phrases.push(`${genre} music shorts`));
   } else if (type === "channel-videos") {
     phrases.push(`${cleanQuery} music videos`);
+    phrases.push(`${cleanQuery} YouTube channel videos`);
+    phrases.push(`${cleanQuery} uploads`);
+    phrases.push(`${cleanQuery} latest videos`);
     phraseGenres.forEach((genre) => phrases.push(`${genre} music videos`));
   } else {
     phrases.push(`${cleanQuery} music video`);
