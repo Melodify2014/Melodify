@@ -23,6 +23,9 @@ const VIDEO_IMPORT_CONCURRENCY = 6;
 const VIDEO_SEARCH_IMPORT_LIMIT = 10;
 const CHANNEL_DISCOVERY_IMPORT_LIMIT = 220;
 const SEARCH_CHANNEL_EXPANSION_LIMIT = 36;
+const SEARCH_CACHE_SCAN_BATCH_SIZE = 80;
+const SEARCH_CACHE_VIDEO_RESULT_LIMIT = 60;
+const SEARCH_CACHE_CHANNEL_RESULT_LIMIT = 12;
 const RECOMMENDATION_DISCOVERY_QUERY_LIMIT = 5;
 const RECOMMENDATION_CHANNEL_QUERY_LIMIT = 4;
 const RECOMMENDATION_IMPORT_LIMIT = 16;
@@ -261,6 +264,7 @@ let appServerVersionSignature = "";
 let appUpdateInProgress = false;
 let followedChannelRefreshInFlight = false;
 let activeSearchRequestId = 0;
+let scheduledPersistTimer = 0;
 const channelAutoLoadRequests = new Map();
 
 const els = {};
@@ -380,6 +384,17 @@ function persist() {
   } catch {
     showToast("Melodify cache is full in this browser. Older browser storage may need clearing.");
   }
+}
+
+function schedulePersist(delay = 500) {
+  window.clearTimeout(scheduledPersistTimer);
+  scheduledPersistTimer = window.setTimeout(() => {
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(() => persist(), { timeout: 2000 });
+    } else {
+      persist();
+    }
+  }, delay);
 }
 
 function bindEvents() {
@@ -927,7 +942,7 @@ async function runSearch(query, filter, options = {}) {
     };
     state.error = "";
     state.loading = false;
-    writeSearchCache(query, filter, state.searchResults);
+    writeSearchCache(query, filter, state.searchResults, { deferPersist: true });
     location.hash = "search";
     render();
     return;
@@ -946,7 +961,7 @@ async function runSearch(query, filter, options = {}) {
         videos: filter === "channels" ? [] : videos,
         channels: filter === "videos" && videos.length ? [] : [result.channel].filter(Boolean)
       };
-      writeSearchCache(query, filter, state.searchResults);
+      writeSearchCache(query, filter, state.searchResults, { deferPersist: true });
     } catch (error) {
       state.error = friendlyFeedError(error);
     } finally {
@@ -959,7 +974,8 @@ async function runSearch(query, filter, options = {}) {
   }
 
   const cached = getCachedSearchEntry(query, filter) || { videos: [], channels: [] };
-  const local = mergeSearchResults(cached, cachedSearch(query, filter));
+  const local = mergeSearchResults(cached, await cachedSearch(query, filter, requestId));
+  if (!isActiveSearchRequest(requestId)) return;
   const hasLocalResults = Boolean(local.videos.length || local.channels.length);
   if (!force && hasLocalResults) {
     state.searchResults = local;
@@ -967,7 +983,7 @@ async function runSearch(query, filter, options = {}) {
     state.loading = false;
     render();
     if (isFileMode()) {
-      writeSearchCache(query, filter, local);
+      writeSearchCache(query, filter, local, { deferPersist: true });
       showToast("Searched saved cache.");
       return;
     }
@@ -992,13 +1008,13 @@ async function runSearch(query, filter, options = {}) {
     if (!isActiveSearchRequest(requestId)) return;
     const merged = mergeSearchResults(local, discovered);
     state.searchResults = merged;
-    writeSearchCache(query, filter, merged);
+    writeSearchCache(query, filter, merged, { deferPersist: true });
     showToast(merged.videos.length || merged.channels.length ? "Discovered and cached new music videos." : "No matching music videos found yet.");
   } catch (error) {
     if (!isActiveSearchRequest(requestId)) return;
     state.searchResults = local;
     state.error = local.videos.length || local.channels.length ? "" : friendlyDiscoveryError(error);
-    if (local.videos.length || local.channels.length) writeSearchCache(query, filter, local);
+    if (local.videos.length || local.channels.length) writeSearchCache(query, filter, local, { deferPersist: true });
     showToast(state.error || "Showing saved cache results.");
   } finally {
     if (!isActiveSearchRequest(requestId)) return;
@@ -1063,7 +1079,7 @@ function scheduleSearchChannelExpansion(query, filter, channels, requestId) {
       const channelsFromExpansion = deriveChannelsFromVideos(expanded, query);
       const merged = mergeSearchResults(state.searchResults, { videos: expanded, channels: channelsFromExpansion });
       state.searchResults = merged;
-      writeSearchCache(query, filter, merged);
+      writeSearchCache(query, filter, merged, { deferPersist: true });
       render();
       showToast("Added more videos from matching creators.");
     } catch {
@@ -1113,7 +1129,7 @@ async function importVideosFromUrls(urls, options = {}) {
     }
     await yieldToBrowser();
   }
-  if (imported.length) persist();
+  if (imported.length) schedulePersist();
   return uniqueVideos(imported);
 }
 
@@ -1513,13 +1529,15 @@ async function expandChannelDiscovery(channelId, force, options = {}) {
       state.recommendedChannels = [];
       state.dailyPlaylists = { date: "", playlists: [] };
     }
-    persist();
+    if (renderUpdates) persist();
+    else schedulePersist();
     if (renderUpdates) render();
     return imported;
   } catch (error) {
     state.channelCache[channelId] = { ...existing, channel, videos: uniqueVideos([...(existing.videos || []), ...storedVideos]), loading: false };
     state.channelDiscoveryFetchedAt[channelId] = Date.now();
-    persist();
+    if (renderUpdates) persist();
+    else schedulePersist();
     if (renderUpdates) render();
     if (force) showToast(friendlyDiscoveryError(error));
     return [];
@@ -2056,25 +2074,86 @@ function demoSearch(query, filter) {
   };
 }
 
-function cachedSearch(query, filter) {
-  const followedVideos = filter !== "channels" ? videosFromFollowedChannels(query) : [];
-  const indexedVideos = filter !== "channels" ? videosFromCreatorIndex(query) : [];
-  const cachedVideoPool = filter !== "channels" ? Object.values(state.videoCache).filter((video) => matchesSearchIntent(video, query)) : [];
-  const likedVideos = filter !== "channels" ? Object.values(state.likedVideos).filter((video) => matchesSearchIntent(video, query)) : [];
-  const matchedVideos = filter !== "channels" ? rankSearchVideos([...followedVideos, ...indexedVideos, ...cachedVideoPool, ...likedVideos], query).slice(0, 60) : [];
+async function cachedSearch(query, filter, requestId = activeSearchRequestId) {
+  let matchedVideos = [];
+  if (filter !== "channels") {
+    const priorityVideos = uniqueVideos([
+      ...videosFromFollowedChannels(query),
+      ...videosFromCreatorIndex(query),
+      ...Object.values(state.likedVideos)
+    ]);
+    matchedVideos = await topSearchVideosByChunks([
+      ...priorityVideos,
+      ...Object.values(state.videoCache)
+    ], query, SEARCH_CACHE_VIDEO_RESULT_LIMIT, requestId);
+  }
+
+  if (!isActiveSearchRequest(requestId)) return { videos: [], channels: [] };
+
   const shouldIncludeChannels = filter !== "videos" || !matchedVideos.length;
-  const indexedChannels = shouldIncludeChannels ? channelsFromCreatorIndex(query) : [];
-  const cachedChannels = shouldIncludeChannels ? uniqueChannels([...Object.values(state.cachedChannels), ...Object.values(state.followedChannels)]).filter((channel) => matchesSearchIntent(channel, query)) : [];
-  const matchedChannels = shouldIncludeChannels ? uniqueChannels([...indexedChannels, ...cachedChannels]) : [];
-  const derivedChannels = deriveChannelsFromVideos(matchedVideos, query);
+  let matchedChannels = [];
+  if (shouldIncludeChannels) {
+    matchedChannels = await topSearchChannelsByChunks([
+      ...channelsFromCreatorIndex(query),
+      ...Object.values(state.followedChannels),
+      ...Object.values(state.cachedChannels),
+      ...deriveChannelsFromVideos(matchedVideos, query)
+    ], query, matchedVideos, SEARCH_CACHE_CHANNEL_RESULT_LIMIT, requestId);
+  }
+
   return {
-    videos: filter !== "channels"
-      ? matchedVideos
-      : [],
-    channels: shouldIncludeChannels
-      ? filterChannelsForQuery([...matchedChannels, ...derivedChannels], query, matchedVideos).slice(0, 12)
-      : []
+    videos: filter !== "channels" ? matchedVideos : [],
+    channels: shouldIncludeChannels ? matchedChannels : []
   };
+}
+
+async function topSearchVideosByChunks(videos, query, limit, requestId) {
+  const scored = [];
+  const seen = new Set();
+  const candidates = uniqueVideos(videos);
+  for (let index = 0; index < candidates.length; index += 1) {
+    if (!isActiveSearchRequest(requestId)) return [];
+    const video = candidates[index];
+    if (!video?.id || seen.has(video.id)) continue;
+    seen.add(video.id);
+    if (isPlayableVideo(video) && isLikelyMusicVideo(video) && matchesSearchIntent(video, query)) {
+      scored.push({ video, score: searchVideoScore(video, query) });
+      trimScoredItems(scored, limit * 2);
+    }
+    if (index > 0 && index % SEARCH_CACHE_SCAN_BATCH_SIZE === 0) await yieldToBrowser();
+  }
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((item) => item.video);
+}
+
+async function topSearchChannelsByChunks(channels, query, videos, limit, requestId) {
+  const videoChannelIds = new Set((videos || []).map((video) => video.channelId).filter(Boolean));
+  const scored = [];
+  const seen = new Set();
+  const candidates = uniqueChannels(channels);
+  for (let index = 0; index < candidates.length; index += 1) {
+    if (!isActiveSearchRequest(requestId)) return [];
+    const channel = candidates[index];
+    if (!channel?.id || seen.has(channel.id)) continue;
+    seen.add(channel.id);
+    if (videoChannelIds.has(channel.id) || matchesSearchIntent(channel, query)) {
+      scored.push({ channel, score: (videoChannelIds.has(channel.id) ? 40 : 0) + queryMatchScore(channel, query) });
+      trimScoredItems(scored, limit * 2);
+    }
+    if (index > 0 && index % SEARCH_CACHE_SCAN_BATCH_SIZE === 0) await yieldToBrowser();
+  }
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((item) => item.channel);
+}
+
+function trimScoredItems(items, limit) {
+  if (items.length <= limit * 2) return;
+  items.sort((a, b) => b.score - a.score);
+  items.length = limit;
 }
 
 function getCachedSearchEntry(query, filter) {
@@ -2087,7 +2166,7 @@ function getCachedSearchEntry(query, filter) {
   return { videos, channels };
 }
 
-function writeSearchCache(query, filter, results) {
+function writeSearchCache(query, filter, results, options = {}) {
   state.searchCache[searchCacheKey(query, filter)] = {
     query,
     filter,
@@ -2095,7 +2174,8 @@ function writeSearchCache(query, filter, results) {
     channelIds: (results.channels || []).map((channel) => channel.id).filter(Boolean),
     fetchedAt: Date.now()
   };
-  persist();
+  if (options.deferPersist) schedulePersist();
+  else persist();
 }
 
 function searchCacheKey(query, filter) {
@@ -2451,12 +2531,7 @@ function ensurePlayer() {
         if (event.data === YTState.PAUSED || event.data === YTState.CUED) state.isPlaying = false;
         if (event.data === YTState.ENDED) {
           state.isPlaying = false;
-          if (state.loop) {
-            ytPlayer.seekTo(0);
-            ytPlayer.playVideo();
-          } else {
-            playAdjacent(1);
-          }
+          handlePlayerEnded();
         }
         renderPlayer();
       },
@@ -2584,11 +2659,28 @@ function togglePlayback() {
   }
 }
 
-function playAdjacent(direction) {
+function handlePlayerEnded() {
+  if (state.loop) {
+    ytPlayer.seekTo(0);
+    ytPlayer.playVideo();
+    return;
+  }
+  if (playAdjacent(1, { silent: true })) return;
+  const fallbackQueue = fallbackPlaybackQueue();
+  const currentId = state.currentVideo?.id || "";
+  const currentIndex = fallbackQueue.findIndex((video) => video.id === currentId);
+  const next = currentIndex >= 0
+    ? fallbackQueue.slice(currentIndex + 1).find(isPlayableVideo) || fallbackQueue.find((video) => video.id !== currentId && isPlayableVideo(video))
+    : fallbackQueue.find((video) => video.id !== currentId && isPlayableVideo(video));
+  if (next) playVideo(next, fallbackQueue);
+}
+
+function playAdjacent(direction, options = {}) {
+  const silent = options === true || Boolean(options.silent);
   if (!state.queue.length) return false;
   const nextIndex = findNextPlayableIndex(direction);
   if (nextIndex < 0) {
-    showToast("No playable videos left in this queue.");
+    if (!silent) showToast("No playable videos left in this queue.");
     return false;
   }
   const next = state.queue[nextIndex];
@@ -2598,6 +2690,24 @@ function playAdjacent(direction) {
     return true;
   }
   return false;
+}
+
+function fallbackPlaybackQueue() {
+  const routeVideos = state.route === "search"
+    ? state.searchResults.videos
+    : state.route === "recommended"
+      ? state.recommendations
+      : state.route === "liked"
+        ? Object.values(state.likedVideos)
+        : state.route === "channel"
+          ? channelVideos(state.activeChannelId)
+          : [];
+  return uniqueVideos([
+    ...state.queue,
+    ...lastVisibleVideos,
+    ...routeVideos,
+    ...demoVideos
+  ]).filter((video) => isPlayableVideo(video) && isLikelyMusicVideo(video));
 }
 
 function findNextPlayableIndex(direction) {
@@ -3062,9 +3172,13 @@ function searchable(item) {
 function rankSearchVideos(videos, query) {
   return uniqueVideos(videos)
     .filter((video) => isPlayableVideo(video) && isLikelyMusicVideo(video) && matchesSearchIntent(video, query))
-    .map((video) => ({ video, score: queryMatchScore(video, query) * 100 + searchPriorityBoost(video, query) + searchRecencyBoost(video) }))
+    .map((video) => ({ video, score: searchVideoScore(video, query) }))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.video);
+}
+
+function searchVideoScore(video, query) {
+  return queryMatchScore(video, query) * 100 + searchPriorityBoost(video, query) + searchRecencyBoost(video);
 }
 
 function searchRecencyBoost(video) {
