@@ -17,10 +17,12 @@ const APP_UPDATE_RELOAD_DELAY_MS = 1200;
 const APP_UPDATE_SERVER_RELOAD_DELAY_MS = 3200;
 const LOCAL_APP_HELP = "Open Melodify from the Desktop or Start Menu shortcut to discover new videos.";
 const LOCAL_PLAYER_HELP = "Open Melodify from the Desktop or Start Menu shortcut to play YouTube videos inside the app.";
-const SEARCH_DISCOVERY_TIMEOUT_MS = 12000;
+const SEARCH_DISCOVERY_TIMEOUT_MS = 7000;
+const METADATA_FETCH_TIMEOUT_MS = 5000;
 const VIDEO_IMPORT_CONCURRENCY = 6;
-const VIDEO_SEARCH_IMPORT_LIMIT = 24;
+const VIDEO_SEARCH_IMPORT_LIMIT = 10;
 const CHANNEL_DISCOVERY_IMPORT_LIMIT = 220;
+const SEARCH_CHANNEL_EXPANSION_LIMIT = 36;
 const RECOMMENDATION_DISCOVERY_QUERY_LIMIT = 5;
 const RECOMMENDATION_CHANNEL_QUERY_LIMIT = 4;
 const RECOMMENDATION_IMPORT_LIMIT = 16;
@@ -258,6 +260,7 @@ let appVersionSignature = "";
 let appServerVersionSignature = "";
 let appUpdateInProgress = false;
 let followedChannelRefreshInFlight = false;
+let activeSearchRequestId = 0;
 const channelAutoLoadRequests = new Map();
 
 const els = {};
@@ -906,7 +909,16 @@ function shouldAutoLoadChannelPage(channelId, activeCache) {
 
 async function runSearch(query, filter, options = {}) {
   const { force = false } = options;
+  const requestId = ++activeSearchRequestId;
+  state.route = "search";
+  state.activeChannelId = "";
+  state.loading = true;
+  state.error = "";
+  render();
+  await yieldToBrowser();
+
   const importedFromInput = await importDirectSearchInput(query);
+  if (!isActiveSearchRequest(requestId)) return;
   if (importedFromInput) {
     const channel = channelFromVideo(importedFromInput);
     state.searchResults = {
@@ -928,6 +940,7 @@ async function runSearch(query, filter, options = {}) {
     render();
     try {
       const result = await refreshChannelLibrary(channelFromInput, { force: true, quiet: true, throwOnError: true });
+      if (!isActiveSearchRequest(requestId)) return;
       const videos = channelVideos(channelFromInput);
       state.searchResults = {
         videos: filter === "channels" ? [] : videos,
@@ -937,6 +950,7 @@ async function runSearch(query, filter, options = {}) {
     } catch (error) {
       state.error = friendlyFeedError(error);
     } finally {
+      if (!isActiveSearchRequest(requestId)) return;
       state.loading = false;
       location.hash = "search";
       render();
@@ -974,20 +988,34 @@ async function runSearch(query, filter, options = {}) {
   render();
 
   try {
-    const discovered = await discoverSearch(query, filter);
+    const discovered = await discoverSearch(query, filter, { requestId });
+    if (!isActiveSearchRequest(requestId)) return;
     const merged = mergeSearchResults(local, discovered);
     state.searchResults = merged;
     writeSearchCache(query, filter, merged);
     showToast(merged.videos.length || merged.channels.length ? "Discovered and cached new music videos." : "No matching music videos found yet.");
   } catch (error) {
+    if (!isActiveSearchRequest(requestId)) return;
     state.searchResults = local;
     state.error = local.videos.length || local.channels.length ? "" : friendlyDiscoveryError(error);
     if (local.videos.length || local.channels.length) writeSearchCache(query, filter, local);
     showToast(state.error || "Showing saved cache results.");
   } finally {
+    if (!isActiveSearchRequest(requestId)) return;
     state.loading = false;
     render();
   }
+}
+
+function isActiveSearchRequest(requestId) {
+  return requestId === activeSearchRequestId;
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 0);
+  });
 }
 
 function mergeSearchResults(a, b) {
@@ -996,7 +1024,8 @@ function mergeSearchResults(a, b) {
   return { videos, channels };
 }
 
-async function discoverSearch(query, filter) {
+async function discoverSearch(query, filter, options = {}) {
+  const { requestId = activeSearchRequestId } = options;
   const imported = filter !== "channels" ? await discoverVideos(query) : [];
   let discoveredChannels = [];
   if (filter !== "videos" || !imported.length || shouldSearchCreatorsForQuery(query)) {
@@ -1007,15 +1036,14 @@ async function discoverSearch(query, filter) {
     }
   }
   const creatorMatchedChannels = discoveredChannels.filter((channel) => creatorMatchesQuery(channel, query));
-  const expanded = filter !== "channels" && (!imported.length || creatorMatchedChannels.length)
-    ? await expandDiscoveredChannels(creatorMatchedChannels.length ? creatorMatchedChannels : discoveredChannels)
-    : [];
+  if (filter !== "channels" && (!imported.length || creatorMatchedChannels.length)) {
+    scheduleSearchChannelExpansion(query, filter, creatorMatchedChannels.length ? creatorMatchedChannels : discoveredChannels, requestId);
+  }
   const indexedChannelVideos = filter !== "channels" ? videosFromCreatorIndex(query) : [];
   const followedChannelVideos = filter !== "channels" ? videosFromFollowedChannels(query) : [];
   const discoveredChannelVideos = uniqueVideos([
     ...followedChannelVideos,
     ...discoveredChannels.flatMap((channel) => channelVideos(channel.id)),
-    ...expanded,
     ...indexedChannelVideos
   ]);
   const videos = filter !== "channels" ? rankSearchVideos([...imported, ...discoveredChannelVideos], query) : [];
@@ -1025,10 +1053,30 @@ async function discoverSearch(query, filter) {
   return { videos, channels };
 }
 
-async function expandDiscoveredChannels(channels) {
+function scheduleSearchChannelExpansion(query, filter, channels, requestId) {
+  if (!channels.length || isFileMode()) return;
+  window.setTimeout(async () => {
+    if (!isActiveSearchRequest(requestId)) return;
+    try {
+      const expanded = await expandDiscoveredChannels(channels, { limit: SEARCH_CHANNEL_EXPANSION_LIMIT, renderUpdates: false });
+      if (!expanded.length || !isActiveSearchRequest(requestId) || state.route !== "search" || state.query !== query || state.filter !== filter) return;
+      const channelsFromExpansion = deriveChannelsFromVideos(expanded, query);
+      const merged = mergeSearchResults(state.searchResults, { videos: expanded, channels: channelsFromExpansion });
+      state.searchResults = merged;
+      writeSearchCache(query, filter, merged);
+      render();
+      showToast("Added more videos from matching creators.");
+    } catch {
+      // Search already has first-pass results; background expansion is best-effort.
+    }
+  }, 0);
+}
+
+async function expandDiscoveredChannels(channels, options = {}) {
+  const { limit = CHANNEL_DISCOVERY_IMPORT_LIMIT, renderUpdates = true } = options;
   const videos = [];
   for (const channel of channels.slice(0, 2)) {
-    videos.push(...await expandChannelDiscovery(channel.id, false));
+    videos.push(...await expandChannelDiscovery(channel.id, false, { limit, renderUpdates }));
   }
   return uniqueVideos(videos);
 }
@@ -1058,12 +1106,14 @@ async function importVideosFromUrls(urls, options = {}) {
   const candidates = uniqueStrings(urls).slice(0, Math.max(limit * 3, limit));
   for (let index = 0; index < candidates.length && imported.length < limit; index += VIDEO_IMPORT_CONCURRENCY) {
     const batch = candidates.slice(index, index + VIDEO_IMPORT_CONCURRENCY);
-    const results = await Promise.all(batch.map((url) => importVideoFromUrl(url, { quiet: true, updateView: false, requireMusic: true, query })));
+    const results = await Promise.all(batch.map((url) => importVideoFromUrl(url, { quiet: true, updateView: false, requireMusic: true, query, deferPersist: true })));
     for (const video of results) {
       if (video && (!enforceIntent || matchesSearchIntent(video, query))) imported.push(video);
       if (imported.length >= limit) break;
     }
+    await yieldToBrowser();
   }
+  if (imported.length) persist();
   return uniqueVideos(imported);
 }
 
@@ -1250,7 +1300,7 @@ function decodeHtmlEntities(value) {
 }
 
 async function importVideoFromUrl(value, options = {}) {
-  const { quiet = false, updateView = true, requireMusic = false, query = "" } = options;
+  const { quiet = false, updateView = true, requireMusic = false, query = "", deferPersist = false } = options;
   const videoId = parseYoutubeVideoId(value);
   if (!videoId) {
     if (!quiet) showToast("Paste a YouTube video URL or video ID.");
@@ -1281,7 +1331,7 @@ async function importVideoFromUrl(value, options = {}) {
     state.recommendations = [];
     state.recommendedChannels = [];
     state.dailyPlaylists = { date: "", playlists: [] };
-    persist();
+    if (!deferPersist) persist();
 
     if (updateView) {
       state.query = video.title;
@@ -1304,7 +1354,14 @@ async function importDirectSearchInput(query) {
 }
 
 async function fetchVideoMetadata(watchUrl) {
-  const response = await fetch(`${OEMBED_PROXY_PATH}?url=${encodeURIComponent(watchUrl)}`, { cache: "no-store" });
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), METADATA_FETCH_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(`${OEMBED_PROXY_PATH}?url=${encodeURIComponent(watchUrl)}`, { cache: "no-store", signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
   const text = await response.text();
   let data = {};
   try {
@@ -1415,7 +1472,8 @@ async function loadChannelVideos(channelId, append) {
     .finally(() => render());
 }
 
-async function expandChannelDiscovery(channelId, force) {
+async function expandChannelDiscovery(channelId, force, options = {}) {
+  const { limit = CHANNEL_DISCOVERY_IMPORT_LIMIT, renderUpdates = true } = options;
   const channel = findChannel(channelId);
   if (!channel || channel.id.startsWith("demo-")) return [];
   if (isFileMode()) {
@@ -1428,17 +1486,17 @@ async function expandChannelDiscovery(channelId, force) {
   const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean);
   const existing = state.channelCache[channelId] || { channel, videos: storedVideos, nextPageToken: "", loading: false };
   state.channelCache[channelId] = { ...existing, channel, videos: uniqueVideos([...(existing.videos || []), ...storedVideos]), loading: true };
-  render();
+  if (renderUpdates) render();
 
   try {
     const query = channelDiscoveryQuery(channel);
     const [videoUrls, shortUrls] = await Promise.all([
-      discoverVideoUrls(query, "channel-videos", CHANNEL_DISCOVERY_IMPORT_LIMIT),
-      discoverVideoUrls(query, "shorts", CHANNEL_DISCOVERY_IMPORT_LIMIT)
+      discoverVideoUrls(query, "channel-videos", limit),
+      discoverVideoUrls(query, "shorts", limit)
     ]);
     const discovered = await importVideosFromUrls([...videoUrls, ...shortUrls], {
       query,
-      limit: CHANNEL_DISCOVERY_IMPORT_LIMIT,
+      limit,
       enforceIntent: false
     });
     const imported = discovered
@@ -1456,13 +1514,13 @@ async function expandChannelDiscovery(channelId, force) {
       state.dailyPlaylists = { date: "", playlists: [] };
     }
     persist();
-    render();
+    if (renderUpdates) render();
     return imported;
   } catch (error) {
     state.channelCache[channelId] = { ...existing, channel, videos: uniqueVideos([...(existing.videos || []), ...storedVideos]), loading: false };
     state.channelDiscoveryFetchedAt[channelId] = Date.now();
     persist();
-    render();
+    if (renderUpdates) render();
     if (force) showToast(friendlyDiscoveryError(error));
     return [];
   }
@@ -1999,13 +2057,15 @@ function demoSearch(query, filter) {
 }
 
 function cachedSearch(query, filter) {
-  const matrix = getMetadataMatrix();
   const followedVideos = filter !== "channels" ? videosFromFollowedChannels(query) : [];
   const indexedVideos = filter !== "channels" ? videosFromCreatorIndex(query) : [];
-  const matchedVideos = filter !== "channels" ? rankSearchVideos([...followedVideos, ...indexedVideos, ...searchMetadataRows(matrix.videoRows, query).map((row) => row.item)], query) : [];
+  const cachedVideoPool = filter !== "channels" ? Object.values(state.videoCache).filter((video) => matchesSearchIntent(video, query)) : [];
+  const likedVideos = filter !== "channels" ? Object.values(state.likedVideos).filter((video) => matchesSearchIntent(video, query)) : [];
+  const matchedVideos = filter !== "channels" ? rankSearchVideos([...followedVideos, ...indexedVideos, ...cachedVideoPool, ...likedVideos], query).slice(0, 60) : [];
   const shouldIncludeChannels = filter !== "videos" || !matchedVideos.length;
   const indexedChannels = shouldIncludeChannels ? channelsFromCreatorIndex(query) : [];
-  const matchedChannels = shouldIncludeChannels ? uniqueChannels([...indexedChannels, ...searchMetadataRows(matrix.channelRows, query).map((row) => row.item)]).filter((channel) => matchesSearchIntent(channel, query)) : [];
+  const cachedChannels = shouldIncludeChannels ? uniqueChannels([...Object.values(state.cachedChannels), ...Object.values(state.followedChannels)]).filter((channel) => matchesSearchIntent(channel, query)) : [];
+  const matchedChannels = shouldIncludeChannels ? uniqueChannels([...indexedChannels, ...cachedChannels]) : [];
   const derivedChannels = deriveChannelsFromVideos(matchedVideos, query);
   return {
     videos: filter !== "channels"
@@ -3002,9 +3062,15 @@ function searchable(item) {
 function rankSearchVideos(videos, query) {
   return uniqueVideos(videos)
     .filter((video) => isPlayableVideo(video) && isLikelyMusicVideo(video) && matchesSearchIntent(video, query))
-    .map((video) => ({ video, score: queryMatchScore(video, query) * 100 + searchPriorityBoost(video, query) + scoreVideo(video) }))
+    .map((video) => ({ video, score: queryMatchScore(video, query) * 100 + searchPriorityBoost(video, query) + searchRecencyBoost(video) }))
     .sort((a, b) => b.score - a.score)
     .map((item) => item.video);
+}
+
+function searchRecencyBoost(video) {
+  const publishedAt = video?.publishedAt ? Date.parse(video.publishedAt) : 0;
+  if (!publishedAt) return 0;
+  return Math.max(0, 40 - (Date.now() - publishedAt) / (30 * 24 * 60 * 60 * 1000));
 }
 
 function searchPriorityBoost(video, query) {

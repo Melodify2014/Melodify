@@ -324,7 +324,7 @@ async function sendYoutubeOembed(res, url, headOnly) {
   }
 
   const metadataUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
-  const text = await fetchText(metadataUrl, { timeout: 6000, accept: "application/json" });
+  const text = await fetchText(metadataUrl, { timeout: 3500, accept: "application/json" });
   if (!text) sendText(res, 502, "Bad Gateway", "{\"error\":\"Metadata unavailable.\"}", headOnly);
   else sendResponse(res, 200, "OK", "application/json; charset=utf-8", text, headOnly);
 }
