@@ -9,6 +9,8 @@ const STATE_DB_KEY = "state";
 const FEED_PROXY_PATH = "/yt/feed";
 const OEMBED_PROXY_PATH = "/yt/oembed";
 const DISCOVERY_PROXY_PATH = "/yt/discover";
+const SPOTIFY_CONFIG_PATH = "/spotify/config";
+const SPOTIFY_SEARCH_PATH = "/spotify/search";
 const APP_VERSION_PATH = "/__melodify/version";
 const APP_RESTART_PATH = "/__melodify/restart";
 const MUSIC_CATEGORY_ID = "10";
@@ -23,6 +25,16 @@ const APP_UPDATE_SERVER_RELOAD_DELAY_MS = 3200;
 const LOCAL_APP_HELP = "Open Melodify from the Desktop or Start Menu shortcut to discover new videos.";
 const LOCAL_PLAYER_HELP = "Open Melodify from the Desktop or Start Menu shortcut to play YouTube videos inside the app.";
 const SEARCH_DISCOVERY_TIMEOUT_MS = 7000;
+const SPOTIFY_SEARCH_TIMEOUT_MS = 4500;
+const SPOTIFY_AUTH_STORAGE = "melodify-spotify-auth-v1";
+const SPOTIFY_PKCE_STORAGE = "melodify-spotify-pkce-v1";
+const SPOTIFY_SCOPES = [
+  "streaming",
+  "user-read-email",
+  "user-read-private",
+  "user-modify-playback-state",
+  "user-read-playback-state"
+].join(" ");
 const METADATA_FETCH_TIMEOUT_MS = 5000;
 const VIDEO_IMPORT_CONCURRENCY = 6;
 const VIDEO_SEARCH_IMPORT_LIMIT = 10;
@@ -253,6 +265,17 @@ const state = {
   sessionBlockedVideos: {},
   recommendations: [],
   recommendedChannels: [],
+  spotify: {
+    configured: false,
+    clientId: "",
+    accessToken: "",
+    expiresAt: 0,
+    connected: false,
+    premiumBlocked: false,
+    playerReady: false,
+    deviceId: "",
+    error: ""
+  },
   loading: false,
   error: ""
 };
@@ -263,6 +286,9 @@ let playerReady = false;
 let playerBlocked = false;
 let localRecordingUrl = "";
 let localRecordingLoading = false;
+let spotifyPlayer = null;
+let spotifySdkReady = false;
+let spotifyPlayerConnecting = false;
 let fileModeToastShown = false;
 let lastVisibleVideos = [];
 let metadataMatrix = null;
@@ -282,6 +308,12 @@ window.onYouTubeIframeAPIReady = () => {
   ensurePlayer();
 };
 
+window.onSpotifyWebPlaybackSDKReady = () => {
+  spotifySdkReady = true;
+  if (state.spotify.premiumBlocked) return;
+  connectSpotifyPlayer().catch(() => {});
+};
+
 document.addEventListener("DOMContentLoaded", () => {
   init().catch(() => {
     try {
@@ -294,6 +326,8 @@ async function init() {
   cacheElements();
   redirectFileModeToLocalApp();
   await hydrateState();
+  await handleSpotifyAuthCallback();
+  await hydrateSpotify();
   primeCache();
   pruneNonMusicCache();
   installIcons(document);
@@ -682,6 +716,11 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "connect-spotify") {
+    await connectSpotify();
+    return;
+  }
+
   if (action === "toggle-play") {
     togglePlayback();
     return;
@@ -797,6 +836,185 @@ function looksLikeVideoFile(file) {
   return /\.(mp4|webm|m4v|mov|mkv)$/i.test(file.name || "");
 }
 
+async function hydrateSpotify() {
+  restoreSpotifyAuth();
+  try {
+    const response = await fetch(SPOTIFY_CONFIG_PATH, { cache: "no-store" });
+    if (response.ok) {
+      const config = await response.json();
+      state.spotify.configured = Boolean(config.configured && config.clientId);
+      state.spotify.clientId = config.clientId || "";
+    }
+  } catch {
+    state.spotify.configured = false;
+  }
+  state.spotify.connected = Boolean(spotifyAccessToken());
+  if (state.spotify.connected && !state.spotify.premiumBlocked) loadSpotifySdk();
+}
+
+function restoreSpotifyAuth() {
+  try {
+    const auth = JSON.parse(localStorage.getItem(SPOTIFY_AUTH_STORAGE) || "{}");
+    state.spotify.premiumBlocked = Boolean(auth.premiumBlocked);
+    state.spotify.accessToken = auth.accessToken || "";
+    state.spotify.expiresAt = Number(auth.expiresAt || 0);
+  } catch {
+    localStorage.removeItem(SPOTIFY_AUTH_STORAGE);
+  }
+}
+
+function saveSpotifyAuth() {
+  if (state.spotify.accessToken) {
+    localStorage.setItem(SPOTIFY_AUTH_STORAGE, JSON.stringify({
+      accessToken: state.spotify.accessToken,
+      expiresAt: state.spotify.expiresAt,
+      premiumBlocked: Boolean(state.spotify.premiumBlocked)
+    }));
+    return;
+  }
+  if (state.spotify.premiumBlocked) {
+    localStorage.setItem(SPOTIFY_AUTH_STORAGE, JSON.stringify({ premiumBlocked: true }));
+    return;
+  }
+  localStorage.removeItem(SPOTIFY_AUTH_STORAGE);
+}
+
+function spotifyAccessToken() {
+  if (state.spotify.premiumBlocked || !state.spotify.accessToken || Date.now() >= state.spotify.expiresAt) {
+    state.spotify.accessToken = "";
+    state.spotify.expiresAt = 0;
+    state.spotify.connected = false;
+    saveSpotifyAuth();
+    return "";
+  }
+  return state.spotify.accessToken;
+}
+
+async function connectSpotify() {
+  if (!state.spotify.configured || !state.spotify.clientId) {
+    showToast("Spotify needs a Spotify Client ID in Render first.");
+    return;
+  }
+  state.spotify.premiumBlocked = false;
+  state.spotify.error = "";
+  saveSpotifyAuth();
+  const verifier = randomString(64);
+  const challenge = await pkceChallenge(verifier);
+  const authState = randomString(24);
+  localStorage.setItem(SPOTIFY_PKCE_STORAGE, JSON.stringify({ verifier, state: authState, returnHash: location.hash || "#home" }));
+  const redirectUri = spotifyRedirectUri();
+  const url = new URL("https://accounts.spotify.com/authorize");
+  url.searchParams.set("client_id", state.spotify.clientId);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("scope", SPOTIFY_SCOPES);
+  url.searchParams.set("state", authState);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("code_challenge", challenge);
+  window.location.href = url.toString();
+}
+
+async function handleSpotifyAuthCallback() {
+  const params = new URLSearchParams(window.location.search || "");
+  const code = params.get("code");
+  const returnedState = params.get("state");
+  if (!code) return;
+  let pkce = {};
+  try {
+    pkce = JSON.parse(localStorage.getItem(SPOTIFY_PKCE_STORAGE) || "{}");
+  } catch {}
+  localStorage.removeItem(SPOTIFY_PKCE_STORAGE);
+  if (!pkce.verifier || pkce.state !== returnedState) {
+    showToast("Spotify login could not be verified.");
+    cleanSpotifyCallbackUrl(pkce.returnHash || "#home");
+    return;
+  }
+  const clientId = state.spotify.clientId || await fetchSpotifyClientId();
+  if (!clientId) {
+    cleanSpotifyCallbackUrl(pkce.returnHash || "#home");
+    return;
+  }
+
+  try {
+    const body = new URLSearchParams({
+      client_id: clientId,
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: spotifyRedirectUri(),
+      code_verifier: pkce.verifier
+    });
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+    if (!response.ok) throw new Error("Spotify token failed");
+    const token = await response.json();
+    state.spotify.accessToken = token.access_token || "";
+    state.spotify.expiresAt = Date.now() + Math.max(60, Number(token.expires_in || 3600) - 60) * 1000;
+    state.spotify.connected = Boolean(state.spotify.accessToken);
+    state.spotify.premiumBlocked = false;
+    state.spotify.error = "";
+    saveSpotifyAuth();
+    if (state.spotify.connected) loadSpotifySdk();
+    showToast("Spotify connected.");
+  } catch {
+    showToast("Spotify login failed.");
+  } finally {
+    cleanSpotifyCallbackUrl(pkce.returnHash || "#home");
+  }
+}
+
+async function fetchSpotifyClientId() {
+  try {
+    const response = await fetch(SPOTIFY_CONFIG_PATH, { cache: "no-store" });
+    if (!response.ok) return "";
+    const config = await response.json();
+    state.spotify.configured = Boolean(config.configured && config.clientId);
+    state.spotify.clientId = config.clientId || "";
+    return state.spotify.clientId;
+  } catch {
+    return "";
+  }
+}
+
+function cleanSpotifyCallbackUrl(returnHash) {
+  history.replaceState(null, "", `${location.pathname}${returnHash || "#home"}`);
+}
+
+function spotifyRedirectUri() {
+  return `${window.location.origin}${window.location.pathname}`;
+}
+
+function randomString(length) {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"[byte % 66]).join("");
+}
+
+async function pkceChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+function base64UrlEncode(bytes) {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function loadSpotifySdk() {
+  if (state.spotify.premiumBlocked) return;
+  if (spotifySdkReady || document.querySelector("script[data-spotify-sdk]")) {
+    connectSpotifyPlayer().catch(() => {});
+    return;
+  }
+  const script = document.createElement("script");
+  script.src = "https://sdk.scdn.co/spotify-player.js";
+  script.async = true;
+  script.dataset.spotifySdk = "true";
+  document.head.append(script);
+}
+
 function routeFromHash() {
   const hash = location.hash.replace(/^#/, "") || "home";
   const [route, channelId] = hash.split("/");
@@ -873,10 +1091,13 @@ function renderHomeView() {
         <p class="eyebrow">No-key YouTube RSS cache</p>
         <h1 class="view-title">Melodify</h1>
       </div>
-      <div class="badge-row">
-        <span class="badge green">${likedCount} liked</span>
-        <span class="badge amber">${followedCount} following</span>
-        <span class="badge">${Object.keys(state.videoCache).length} cached</span>
+      <div class="view-actions">
+        <div class="badge-row">
+          <span class="badge green">${likedCount} liked</span>
+          <span class="badge amber">${followedCount} following</span>
+          <span class="badge">${Object.keys(state.videoCache).length} cached</span>
+        </div>
+        ${renderSpotifyConnectButton()}
       </div>
     </header>
     <section>
@@ -884,6 +1105,27 @@ function renderHomeView() {
       ${renderVideoGrid(picks)}
     </section>
     ${channelHtml}
+  `;
+}
+
+function renderSpotifyConnectButton() {
+  if (!state.spotify.configured) return "";
+  if (state.spotify.premiumBlocked) {
+    return `
+      <button class="secondary-button" type="button" data-action="connect-spotify" title="Spotify playback requires Premium. Melodify is using YouTube only.">
+        <span data-icon="music" aria-hidden="true"></span>
+        <span>Connect Spotify Premium</span>
+      </button>
+    `;
+  }
+  if (state.spotify.connected) {
+    return `<span class="badge green">Spotify connected</span>`;
+  }
+  return `
+    <button class="secondary-button" type="button" data-action="connect-spotify">
+      <span data-icon="music" aria-hidden="true"></span>
+      <span>Connect Spotify</span>
+    </button>
   `;
 }
 
@@ -1064,27 +1306,33 @@ function renderVideoGrid(videos) {
 function renderVideoCard(video) {
   const liked = isLiked(video.id);
   const channel = channelFromVideo(video);
+  const spotify = isSpotifyVideo(video);
   const recorded = hasRecording(video.id);
   const unavailable = !recorded && !isPlayableVideo(video);
-  const status = recorded ? "Recorded" : unavailable ? "Unavailable" : video.duration || "Music video";
+  const status = spotify ? "Spotify track" : recorded ? "Recorded" : unavailable ? "Unavailable" : video.duration || "Music video";
+  const channelControl = spotify
+    ? `<a class="link-button" href="${escapeAttr(video.spotifyUrl || "https://open.spotify.com")}" target="_blank" rel="noreferrer">${escapeHtml(video.channelTitle)}</a>`
+    : `<button class="link-button" type="button" data-action="open-channel" data-channel-id="${escapeAttr(video.channelId)}">${escapeHtml(video.channelTitle)}</button>`;
+  const recordingButton = spotify ? "" : `
+        <button class="mini-action ${recorded ? "active" : ""}" type="button" data-action="attach-recording" data-video-id="${escapeAttr(video.id)}" aria-label="${recorded ? "Replace" : "Add"} offline recording for ${escapeAttr(video.title)}" title="${recorded ? "Replace recording" : "Add offline recording"}">
+          ${icon(recorded ? "check" : "plus")}
+        </button>`;
   return `
     <article class="video-card ${unavailable ? "unavailable" : ""}">
       <button class="thumb-button" type="button" data-action="${unavailable ? "noop" : "play"}" data-video-id="${escapeAttr(video.id)}" aria-label="Play ${escapeAttr(video.title)}" ${unavailable ? "disabled" : ""}>
         <img src="${escapeAttr(video.thumbnail)}" alt="" loading="lazy">
-        <span class="thumb-overlay">${icon(unavailable ? "alert" : "play")}</span>
+        <span class="thumb-overlay">${icon(unavailable ? "alert" : spotify ? "music" : "play")}</span>
       </button>
       <div>
         <h2 class="video-title">${escapeHtml(video.title)}</h2>
-        <button class="link-button" type="button" data-action="open-channel" data-channel-id="${escapeAttr(video.channelId)}">${escapeHtml(video.channelTitle)}</button>
+        ${channelControl}
         <p class="meta">${escapeHtml(status)} ${video.publishedAt ? " / " + escapeHtml(formatDate(video.publishedAt)) : ""}</p>
       </div>
       <div class="card-actions">
         <button class="mini-action ${liked ? "active" : ""}" type="button" data-action="like" data-video-id="${escapeAttr(video.id)}" aria-label="${liked ? "Unlike" : "Like"} ${escapeAttr(video.title)}" title="${liked ? "Unlike" : "Like"}">
           ${icon("heart")}
         </button>
-        <button class="mini-action ${recorded ? "active" : ""}" type="button" data-action="attach-recording" data-video-id="${escapeAttr(video.id)}" aria-label="${recorded ? "Replace" : "Add"} offline recording for ${escapeAttr(video.title)}" title="${recorded ? "Replace recording" : "Add offline recording"}">
-          ${icon(recorded ? "check" : "plus")}
-        </button>
+        ${recordingButton}
         <button class="mini-action ${isFollowing(channel.id) ? "active" : ""}" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}" aria-label="Subscribe to ${escapeAttr(channel.title)}" title="Subscribe">
           ${icon(isFollowing(channel.id) ? "check" : "user-plus")}
         </button>
@@ -1156,25 +1404,28 @@ function renderStatus(title, message, iconName) {
 function renderPlayer() {
   const video = state.currentVideo;
   const hasVideo = Boolean(video);
+  const spotify = hasVideo && isSpotifyVideo(video);
   const hasLocalRecording = hasVideo && hasRecording(video.id);
   const hasEmbeddedPlayer = Boolean(ytPlayer || getLocalPlayer());
 
   document.body.classList.toggle("has-current", hasVideo);
-  els.playerSource.textContent = hasVideo ? hasLocalRecording ? "Offline recording" : "YouTube music video" : "Ready";
+  els.playerSource.textContent = hasVideo ? spotify ? "Spotify track" : hasLocalRecording ? "Offline recording" : "YouTube music video" : "Ready";
   els.playerTitle.textContent = hasVideo ? video.title : "Choose a music video";
   els.playerChannel.textContent = hasVideo ? video.channelTitle : "Melodify";
   els.playerChannel.disabled = !hasVideo;
   els.trackArt.style.backgroundImage = hasVideo ? `url("${video.thumbnail}")` : "";
   els.playButtonIcon.innerHTML = icon(state.isPlaying ? "pause" : "play");
   els.loopButton.classList.toggle("active", state.loop);
-  els.playerRecording.disabled = !hasVideo;
+  els.playerRecording.disabled = !hasVideo || spotify;
   els.playerRecording.classList.toggle("active", hasLocalRecording);
   els.playerRecording.title = hasLocalRecording ? "Replace offline recording" : "Add offline recording";
   els.playerRecording.setAttribute("aria-label", hasVideo ? `${hasLocalRecording ? "Replace" : "Add"} offline recording for ${video.title}` : "Add offline recording");
   els.playerRecordingIcon.innerHTML = icon(hasLocalRecording ? "check" : "plus");
   els.playerLike.disabled = !hasVideo;
-  els.playerSubscribe.disabled = !hasVideo;
-  els.youtubeLink.href = hasVideo ? `https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}` : "https://www.youtube.com";
+  els.playerSubscribe.disabled = !hasVideo || spotify;
+  els.youtubeLink.href = hasVideo ? spotify ? video.spotifyUrl || "https://open.spotify.com" : `https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}` : "https://www.youtube.com";
+  els.youtubeLink.title = hasVideo && spotify ? "Open on Spotify" : "Open on YouTube";
+  els.youtubeLink.setAttribute("aria-label", hasVideo && spotify ? "Open on Spotify" : "Open on YouTube");
 
   if (hasVideo) {
     els.playerLike.classList.toggle("active", isLiked(video.id));
@@ -1348,9 +1599,129 @@ function mergeSearchResults(a, b) {
   return { videos, channels };
 }
 
+async function fetchSpotifyCatalog(query) {
+  if (!query || isOffline() || state.spotify.premiumBlocked) return { videos: [], queries: [] };
+  try {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), SPOTIFY_SEARCH_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(`${SPOTIFY_SEARCH_PATH}?q=${encodeURIComponent(query)}`, { cache: "no-store", signal: controller.signal });
+    } finally {
+      window.clearTimeout(timer);
+    }
+    if (response.ok) {
+      const data = await response.json();
+      if (data?.configured) {
+        const videos = shouldShowSpotifyTrackResults() ? spotifyTracksToVideos(data.tracks || []) : [];
+        if (videos.length) cacheVideos(videos, "spotify", false);
+        return { videos, queries: data.queries || spotifyQueriesFromTracks(data.tracks || [], data.artists || []) };
+      }
+    }
+  } catch {
+    // Spotify catalogue search is optional; YouTube discovery continues without it.
+  }
+
+  if (state.spotify.connected) {
+    return await fetchSpotifyCatalogWithUserToken(query);
+  }
+  return { videos: [], queries: [] };
+}
+
+async function fetchSpotifyCatalogWithUserToken(query) {
+  try {
+    const token = spotifyAccessToken();
+    if (!token) return { videos: [], queries: [] };
+    const url = new URL("https://api.spotify.com/v1/search");
+    url.searchParams.set("q", query);
+    url.searchParams.set("type", "track,artist");
+    url.searchParams.set("limit", "8");
+    url.searchParams.set("market", "from_token");
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json"
+      }
+    });
+    if (!response.ok) return { videos: [], queries: [] };
+    const data = await response.json();
+    const tracks = (data.tracks?.items || []).map(compactSpotifyTrack).filter(Boolean);
+    const artists = (data.artists?.items || []).map(compactSpotifyArtist).filter(Boolean);
+    const videos = shouldShowSpotifyTrackResults() ? spotifyTracksToVideos(tracks) : [];
+    if (videos.length) cacheVideos(videos, "spotify", false);
+    return { videos, queries: spotifyQueriesFromTracks(tracks, artists) };
+  } catch {
+    return { videos: [], queries: [] };
+  }
+}
+
+function spotifyTracksToVideos(tracks) {
+  return (tracks || []).map((track) => {
+    const artist = track.artists?.[0] || "Spotify";
+    return {
+      id: `spotify:${track.id}`,
+      source: "spotify",
+      spotifyId: track.id,
+      spotifyUri: `spotify:track:${track.id}`,
+      spotifyUrl: track.spotifyUrl || `https://open.spotify.com/track/${track.id}`,
+      title: `${artist} - ${track.name}`,
+      channelId: `spotify:${normalizeCreatorKey(artist) || track.id}`,
+      channelTitle: artist,
+      thumbnail: track.image || "",
+      publishedAt: "",
+      duration: "Spotify",
+      durationSeconds: 0,
+      embeddable: true,
+      isShort: false,
+      categoryId: MUSIC_CATEGORY_ID,
+      tags: uniqueStrings(["spotify", "music", "song", "track", ...(track.artists || []), track.album].filter(Boolean)),
+      viewCount: track.popularity || ""
+    };
+  });
+}
+
+function spotifyQueriesFromTracks(tracks, artists) {
+  const trackQueries = (tracks || []).flatMap((track) => {
+    const artist = track.artists?.[0] || "";
+    return [
+      `${artist} ${track.name} official music video`,
+      `${artist} ${track.name} official audio`
+    ];
+  });
+  const artistQueries = (artists || []).map((artist) => `${artist.name} ${(artist.genres || [])[0] || "music"} music videos`);
+  return uniqueStrings([...trackQueries, ...artistQueries].map((item) => String(item || "").replace(/\s+/g, " ").trim()).filter(Boolean)).slice(0, 8);
+}
+
+function compactSpotifyTrack(track) {
+  if (!track?.id || !track?.name) return null;
+  return {
+    id: track.id,
+    name: track.name,
+    artists: (track.artists || []).map((artist) => artist?.name).filter(Boolean).slice(0, 4),
+    album: track.album?.name || "",
+    image: track.album?.images?.[0]?.url || track.image || "",
+    popularity: Number(track.popularity || 0),
+    spotifyUrl: track.external_urls?.spotify || track.spotifyUrl || "",
+    isrc: track.external_ids?.isrc || track.isrc || ""
+  };
+}
+
+function compactSpotifyArtist(artist) {
+  if (!artist?.id || !artist?.name) return null;
+  return {
+    id: artist.id,
+    name: artist.name,
+    genres: (artist.genres || []).slice(0, 8),
+    image: artist.images?.[0]?.url || artist.image || "",
+    popularity: Number(artist.popularity || 0),
+    spotifyUrl: artist.external_urls?.spotify || artist.spotifyUrl || ""
+  };
+}
+
 async function discoverSearch(query, filter, options = {}) {
   const { requestId = activeSearchRequestId } = options;
-  const imported = filter !== "channels" ? await discoverVideos(query) : [];
+  const spotifyCatalog = filter !== "channels" ? await fetchSpotifyCatalog(query) : { videos: [], queries: [] };
+  const imported = filter !== "channels" ? await discoverVideos(query, { spotifyQueries: spotifyCatalog.queries }) : [];
   let discoveredChannels = [];
   if (filter !== "videos" || !imported.length || shouldSearchCreatorsForQuery(query)) {
     try {
@@ -1370,7 +1741,7 @@ async function discoverSearch(query, filter, options = {}) {
     ...discoveredChannels.flatMap((channel) => channelVideos(channel.id)),
     ...indexedChannelVideos
   ]);
-  const videos = filter !== "channels" ? rankSearchVideos([...imported, ...discoveredChannelVideos], query) : [];
+  const videos = filter !== "channels" ? rankSearchVideos([...spotifyCatalog.videos, ...imported, ...discoveredChannelVideos], query) : [];
   const channels = filter !== "videos" || !videos.length
     ? filterChannelsForQuery([...discoveredChannels, ...deriveChannelsFromVideos(videos, query)], query, videos)
     : [];
@@ -1406,11 +1777,12 @@ async function expandDiscoveredChannels(channels, options = {}) {
 }
 
 async function discoverVideos(query, options = {}) {
-  const { limit = VIDEO_SEARCH_IMPORT_LIMIT, enforceIntent = true } = options;
-  const responses = await Promise.allSettled([
-    fetchDiscoveryText(query, "videos"),
-    fetchDiscoveryText(query, "shorts")
-  ]);
+  const { limit = VIDEO_SEARCH_IMPORT_LIMIT, enforceIntent = true, spotifyQueries = [] } = options;
+  const discoveryQueries = uniqueStrings([query, ...spotifyQueries]).slice(0, 4);
+  const responses = await Promise.allSettled(discoveryQueries.flatMap((item) => [
+    fetchDiscoveryText(item, "videos"),
+    fetchDiscoveryText(item, "shorts")
+  ]));
   const texts = responses.filter((result) => result.status === "fulfilled").map((result) => result.value);
   if (!texts.length) throw responses.find((result) => result.status === "rejected")?.reason || new Error("Discovery unavailable");
   const urls = uniqueStrings(texts.flatMap(extractYoutubeVideoUrls));
@@ -2674,6 +3046,10 @@ function cacheVideo(video, source = "seen", shouldPersist = true) {
 function compactVideo(video) {
   return {
     id: video.id,
+    source: video.source || "",
+    spotifyId: video.spotifyId || "",
+    spotifyUri: video.spotifyUri || "",
+    spotifyUrl: video.spotifyUrl || "",
     title: video.title || "Untitled music video",
     channelId: video.channelId || "",
     channelTitle: video.channelTitle || "YouTube creator",
@@ -2791,6 +3167,11 @@ async function playVideo(video, queue) {
   state.queue = nextQueue;
   state.queueIndex = Math.max(0, state.queue.findIndex((item) => item.id === video.id));
 
+  if (isSpotifyVideo(video)) {
+    await playSpotifyTrack(video);
+    return;
+  }
+
   if (!isPlayableVideo(video)) {
     const nextIndex = findNextPlayableIndex(1);
     if (nextIndex >= 0 && state.queue[nextIndex]?.id !== video.id) {
@@ -2825,6 +3206,7 @@ async function playVideo(video, queue) {
 
 function ensurePlayer() {
   if (!state.currentVideo || ytPlayer || getLocalPlayer() || localRecordingLoading) return;
+  if (isSpotifyVideo(state.currentVideo)) return;
   if (hasRecording(state.currentVideo.id)) {
     playLocalRecording(state.currentVideo).catch(() => {
       handleOfflinePlayer();
@@ -2949,6 +3331,233 @@ function destroyYouTubePlayer() {
   ytPlayer = null;
 }
 
+async function playSpotifyTrack(video) {
+  if (!canUseSpotifyPlayback()) {
+    await playSpotifyFallback(video, state.spotify.premiumBlocked
+      ? "Spotify needs Premium, so Melodify is using YouTube only."
+      : "Using YouTube unless Spotify Premium is connected.");
+    return;
+  }
+
+  playerBlocked = false;
+  state.currentVideo = video;
+  state.queue = uniqueVideos(Array.isArray(state.queue) && state.queue.length ? state.queue : [video]);
+  state.queueIndex = Math.max(0, state.queue.findIndex((item) => item.id === video.id));
+  const removedRecommendation = markWatched(video, false);
+  persist();
+  if (removedRecommendation && state.route === "recommended") render();
+  else renderPlayer();
+
+  destroyYouTubePlayer();
+  resetPlayerElement();
+  setSpotifyPlayerFrame(video, "Starting Spotify");
+
+  const ready = await connectSpotifyPlayer();
+  if (!ready) {
+    await playSpotifyFallback(video, state.spotify.error || "Spotify playback is unavailable, so Melodify is using YouTube.");
+    return;
+  }
+
+  const response = await spotifyApi(`https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(state.spotify.deviceId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ uris: [video.spotifyUri] })
+  });
+  if (!response?.ok) {
+    const premiumRequired = response?.status === 403;
+    const message = premiumRequired
+      ? "Spotify Premium is required for playback in Melodify."
+      : "Spotify could not start this track.";
+    if (premiumRequired) markSpotifyPremiumBlocked(message);
+    state.spotify.error = message;
+    await playSpotifyFallback(video, `${message} Using YouTube instead.`);
+    return;
+  }
+  state.isPlaying = true;
+  setSpotifyPlayerFrame(video, "Playing from Spotify");
+  renderPlayer();
+}
+
+async function connectSpotifyPlayer() {
+  if (state.spotify.premiumBlocked || !spotifyAccessToken()) return false;
+  if (state.spotify.playerReady && state.spotify.deviceId) return true;
+  if (!spotifySdkReady) {
+    loadSpotifySdk();
+    return false;
+  }
+  if (spotifyPlayerConnecting) return false;
+  spotifyPlayerConnecting = true;
+
+  try {
+    if (!spotifyPlayer) {
+      spotifyPlayer = new window.Spotify.Player({
+        name: "Melodify",
+        getOAuthToken: (callback) => callback(spotifyAccessToken()),
+        volume: 0.7
+      });
+      spotifyPlayer.addListener("ready", ({ device_id: deviceId }) => {
+        state.spotify.deviceId = deviceId;
+        state.spotify.playerReady = true;
+        state.spotify.error = "";
+        renderPlayer();
+      });
+      spotifyPlayer.addListener("not_ready", () => {
+        state.spotify.playerReady = false;
+      });
+      spotifyPlayer.addListener("player_state_changed", (playerState) => {
+        if (!playerState || !isSpotifyVideo(state.currentVideo)) return;
+        state.isPlaying = !playerState.paused;
+        renderPlayer();
+      });
+      spotifyPlayer.addListener("initialization_error", ({ message }) => {
+        state.spotify.error = message || "Spotify player could not start.";
+      });
+      spotifyPlayer.addListener("authentication_error", () => {
+        state.spotify.error = "Spotify login expired.";
+        state.spotify.accessToken = "";
+        state.spotify.connected = false;
+        saveSpotifyAuth();
+        render();
+      });
+      spotifyPlayer.addListener("account_error", () => {
+        markSpotifyPremiumBlocked("Spotify Premium is required, so Melodify will use YouTube only.");
+        showToast(state.spotify.error);
+      });
+      spotifyPlayer.addListener("playback_error", ({ message }) => {
+        state.spotify.error = message || "Spotify playback failed.";
+        showToast(state.spotify.error);
+      });
+    }
+    await spotifyPlayer.connect();
+    if (!state.spotify.playerReady || !state.spotify.deviceId) await waitForSpotifyDevice();
+    return Boolean(state.spotify.playerReady && state.spotify.deviceId);
+  } catch {
+    state.spotify.error = "Spotify player could not connect.";
+    return false;
+  } finally {
+    spotifyPlayerConnecting = false;
+  }
+}
+
+function canUseSpotifyPlayback() {
+  return Boolean(state.spotify.configured && !state.spotify.premiumBlocked && state.spotify.connected && spotifyAccessToken());
+}
+
+function shouldShowSpotifyTrackResults() {
+  return canUseSpotifyPlayback() && state.spotify.playerReady;
+}
+
+function markSpotifyPremiumBlocked(message) {
+  state.spotify.premiumBlocked = true;
+  state.spotify.connected = false;
+  state.spotify.accessToken = "";
+  state.spotify.expiresAt = 0;
+  state.spotify.playerReady = false;
+  state.spotify.deviceId = "";
+  state.spotify.error = message || "Spotify Premium is required, so Melodify will use YouTube only.";
+  if (spotifyPlayer) {
+    try {
+      spotifyPlayer.disconnect();
+    } catch {}
+  }
+  spotifyPlayer = null;
+  saveSpotifyAuth();
+}
+
+async function playSpotifyFallback(video, message) {
+  if (message) showToast(message);
+  setSpotifyPlayerFrame(video, "Finding a YouTube version");
+  const fallback = await findYoutubeFallbackForSpotify(video);
+  if (fallback) {
+    const queue = uniqueVideos([
+      fallback,
+      ...(state.queue || []).filter((item) => item.id !== video.id && !isSpotifyVideo(item))
+    ]);
+    await playVideo(fallback, queue);
+    return true;
+  }
+
+  state.currentVideo = video;
+  state.isPlaying = false;
+  renderPlayer();
+  setPlayerFallback(
+    "Using YouTube only",
+    "Melodify could not find a YouTube version for this Spotify track yet.",
+    0
+  );
+  return false;
+}
+
+async function findYoutubeFallbackForSpotify(video) {
+  const query = spotifyFallbackQuery(video);
+  const cached = rankSearchVideos(Object.values(state.videoCache).filter((item) => !isSpotifyVideo(item)), query)[0];
+  if (cached) return cached;
+  if (isOffline() || isFileMode()) return null;
+  try {
+    const discovered = await discoverVideos(query, { limit: 8, enforceIntent: true });
+    return rankSearchVideos(discovered.filter((item) => !isSpotifyVideo(item)), query)[0] || discovered.find((item) => !isSpotifyVideo(item)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function spotifyFallbackQuery(video) {
+  const artist = String(video?.channelTitle || "").trim();
+  let title = String(video?.title || "").trim();
+  if (artist) {
+    title = title.replace(new RegExp(`^${escapeRegExp(artist)}\\s*-\\s*`, "i"), "").trim();
+  }
+  return uniqueStrings([artist, title, "official audio"]).join(" ").replace(/\s+/g, " ").trim();
+}
+
+function waitForSpotifyDevice() {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const check = () => {
+      if (state.spotify.playerReady && state.spotify.deviceId) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() - startedAt > 5000) {
+        resolve(false);
+        return;
+      }
+      window.setTimeout(check, 120);
+    };
+    check();
+  });
+}
+
+async function spotifyApi(url, options = {}) {
+  const token = spotifyAccessToken();
+  if (!token) return null;
+  return await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(options.headers || {})
+    }
+  });
+}
+
+function setSpotifyPlayerFrame(video, status) {
+  playerBlocked = false;
+  els.emptyPlayer.className = "empty-player spotify-player-frame";
+  els.emptyPlayer.hidden = false;
+  els.emptyPlayer.innerHTML = `
+    <div class="spotify-frame-copy">
+      ${video.thumbnail ? `<img src="${escapeAttr(video.thumbnail)}" alt="">` : `<span data-icon="music" aria-hidden="true"></span>`}
+      <div>
+        <p class="eyebrow">Spotify</p>
+        <h3>${escapeHtml(video.title)}</h3>
+        <p>${escapeHtml(status || "Spotify playback")}</p>
+      </div>
+    </div>
+  `;
+  installIcons(els.emptyPlayer);
+}
+
 function handleOfflinePlayer() {
   playerBlocked = true;
   resetPlayerElement();
@@ -3063,6 +3672,17 @@ function togglePlayback() {
   if (!state.currentVideo) {
     const first = lastVisibleVideos[0] || demoVideos[0];
     playVideo(first, lastVisibleVideos.length ? lastVisibleVideos : demoVideos);
+    return;
+  }
+
+  if (isSpotifyVideo(state.currentVideo)) {
+    if (!canUseSpotifyPlayback() || !spotifyPlayer) {
+      playSpotifyTrack(state.currentVideo).catch(() => {});
+      return;
+    }
+    spotifyPlayer.togglePlay().catch(() => {
+      showToast("Spotify playback needs a connected Premium account.");
+    });
     return;
   }
 
@@ -3196,6 +3816,10 @@ function hasRecording(videoId) {
   return Boolean(videoId && state.recordings?.[videoId]);
 }
 
+function isSpotifyVideo(video) {
+  return Boolean(video?.source === "spotify" || video?.spotifyUri || String(video?.id || "").startsWith("spotify:"));
+}
+
 function getRecordedVideos() {
   return Object.keys(state.recordings || {})
     .map((id) => findVideo(id) || videoFromRecordingMetadata(id))
@@ -3313,6 +3937,7 @@ function isUnavailable(videoId) {
 }
 
 function isPlayableVideo(video) {
+  if (isSpotifyVideo(video)) return canUseSpotifyPlayback();
   return Boolean(video?.id) && (hasRecording(video.id) || !isUnavailable(video.id));
 }
 
@@ -3749,6 +4374,7 @@ function itemAcronyms(item) {
 
 function isLikelyMusicVideo(video, query = "") {
   if (!video?.id) return false;
+  if (isSpotifyVideo(video)) return true;
   if (String(video.channelId || "").startsWith("demo-")) return true;
 
   const text = searchable(video);

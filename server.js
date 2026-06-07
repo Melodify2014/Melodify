@@ -11,6 +11,10 @@ const DISCOVERY_BUDGET_MS = 10000;
 const DISCOVERY_READER_TIMEOUT_MS = 4500;
 const DISCOVERY_CHANNEL_READER_TIMEOUT_MS = 2500;
 const DISCOVERY_SOURCE_TIMEOUT_MS = 2000;
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search";
+const SPOTIFY_SEARCH_LIMIT = 8;
+const SPOTIFY_MARKET = process.env.SPOTIFY_MARKET || "US";
 const VERSION_FILES = [
   "index.html",
   "styles.css",
@@ -28,6 +32,7 @@ const BLOCKED_STATIC_PATTERNS = [
   /\.(?:bat|ps1|vbs)$/i,
   /^(?:server\.js|package(?:-lock)?\.json|render\.yaml)$/i
 ];
+let spotifyTokenCache = { accessToken: "", expiresAt: 0 };
 const GENRE_ALIASES = {
   phonk: ["phonk", "drift phonk", "memphis rap"],
   lofi: ["lofi", "lo-fi", "lofi hip hop", "chillhop", "study beats", "study music"],
@@ -410,6 +415,144 @@ async function sendYoutubeDiscovery(res, url, headOnly) {
   else sendText(res, 502, "Bad Gateway", "Discovery unavailable.", headOnly);
 }
 
+async function sendSpotifySearch(res, url, headOnly) {
+  const query = queryValue(url, "q").trim();
+  if (!query || query.length > 120) {
+    sendJson(res, 400, "Bad Request", { error: "Invalid Spotify search query." }, headOnly);
+    return;
+  }
+
+  const token = await spotifyAccessToken();
+  if (!token) {
+    sendJson(res, 503, "Service Unavailable", { configured: false, tracks: [], artists: [], queries: [] }, headOnly);
+    return;
+  }
+
+  const searchUrl = new URL(SPOTIFY_SEARCH_URL);
+  searchUrl.searchParams.set("q", query);
+  searchUrl.searchParams.set("type", "track,artist");
+  searchUrl.searchParams.set("limit", String(SPOTIFY_SEARCH_LIMIT));
+  searchUrl.searchParams.set("market", SPOTIFY_MARKET);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const response = await fetch(searchUrl, {
+      signal: controller.signal,
+      headers: {
+        "Accept": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "Melodify Spotify Catalog"
+      }
+    });
+    if (!response.ok) {
+      sendJson(res, response.status === 429 ? 429 : 502, response.statusText || "Spotify search failed", { configured: true, tracks: [], artists: [], queries: [] }, headOnly);
+      return;
+    }
+
+    const data = await response.json();
+    const tracks = (data.tracks?.items || []).map(compactSpotifyTrack).filter(Boolean);
+    const artists = (data.artists?.items || []).map(compactSpotifyArtist).filter(Boolean);
+    const queries = spotifyYoutubeQueries(tracks, artists);
+    sendJson(res, 200, "OK", { configured: true, tracks, artists, queries }, headOnly);
+  } catch {
+    sendJson(res, 502, "Bad Gateway", { configured: true, tracks: [], artists: [], queries: [] }, headOnly);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sendSpotifyConfig(res, headOnly) {
+  sendJson(res, 200, "OK", {
+    configured: Boolean(process.env.SPOTIFY_CLIENT_ID),
+    clientId: process.env.SPOTIFY_CLIENT_ID || "",
+    market: SPOTIFY_MARKET
+  }, headOnly);
+}
+
+async function spotifyAccessToken() {
+  const clientId = process.env.SPOTIFY_CLIENT_ID || "";
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET || "";
+  if (!clientId || !clientSecret) return "";
+  if (spotifyTokenCache.accessToken && Date.now() < spotifyTokenCache.expiresAt) return spotifyTokenCache.accessToken;
+
+  const body = new URLSearchParams({ grant_type: "client_credentials" });
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const response = await fetch(SPOTIFY_TOKEN_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+      },
+      body
+    });
+    if (!response.ok) return "";
+    const token = await response.json();
+    const accessToken = token.access_token || "";
+    if (!accessToken) return "";
+    spotifyTokenCache = {
+      accessToken,
+      expiresAt: Date.now() + Math.max(60, Number(token.expires_in || 3600) - 60) * 1000
+    };
+    return accessToken;
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function compactSpotifyTrack(track) {
+  if (!track?.id || !track?.name) return null;
+  const artists = (track.artists || []).map((artist) => artist?.name).filter(Boolean).slice(0, 4);
+  return {
+    id: track.id,
+    name: track.name,
+    artists,
+    album: track.album?.name || "",
+    image: track.album?.images?.[0]?.url || "",
+    popularity: Number(track.popularity || 0),
+    spotifyUrl: track.external_urls?.spotify || "",
+    isrc: track.external_ids?.isrc || ""
+  };
+}
+
+function compactSpotifyArtist(artist) {
+  if (!artist?.id || !artist?.name) return null;
+  return {
+    id: artist.id,
+    name: artist.name,
+    genres: (artist.genres || []).slice(0, 8),
+    image: artist.images?.[0]?.url || "",
+    popularity: Number(artist.popularity || 0),
+    spotifyUrl: artist.external_urls?.spotify || ""
+  };
+}
+
+function spotifyYoutubeQueries(tracks, artists) {
+  const trackQueries = tracks
+    .sort((a, b) => b.popularity - a.popularity)
+    .flatMap((track) => {
+      const artist = track.artists[0] || "";
+      return [
+        `${artist} ${track.name} official music video`,
+        `${artist} ${track.name} official audio`
+      ];
+    });
+  const artistQueries = artists
+    .sort((a, b) => b.popularity - a.popularity)
+    .map((artist) => {
+      const genre = artist.genres?.[0] || "music";
+      return `${artist.name} ${genre} music videos`;
+    });
+  return [...new Set([...trackQueries, ...artistQueries].map((item) => item.replace(/\s+/g, " ").trim()).filter(Boolean))].slice(0, 8);
+}
+
 function discoveryTimeout(deadline, preferredTimeout) {
   if (!deadline) return preferredTimeout;
   const remaining = deadline - Date.now();
@@ -449,6 +592,8 @@ const server = http.createServer((req, res) => {
     else if (url.pathname === "/yt/feed") await sendYoutubeFeed(res, url, headOnly);
     else if (url.pathname === "/yt/oembed") await sendYoutubeOembed(res, url, headOnly);
     else if (url.pathname === "/yt/discover") await sendYoutubeDiscovery(res, url, headOnly);
+    else if (url.pathname === "/spotify/config") sendSpotifyConfig(res, headOnly);
+    else if (url.pathname === "/spotify/search") await sendSpotifySearch(res, url, headOnly);
     else await sendStatic(res, url, headOnly);
   }).catch(() => {
     if (!res.headersSent) sendText(res, 500, "Internal Server Error", "Melodify could not handle this request.", headOnly);

@@ -1,10 +1,10 @@
 # Melodify
 
-Melodify is an installable static web app for playing YouTube music videos in a Spotify-style interface. It has search, app-level likes, app-level channel subscriptions, followed-channel pages, a bottom player bar, loop controls, and profile-based recommendations.
+Melodify is an installable web app for playing YouTube music videos and, when configured, Spotify tracks in a Spotify-style interface. It has search, app-level likes, app-level channel subscriptions, followed-channel pages, a bottom player bar, loop controls, and profile-based recommendations.
 
 Melodify keeps a browser cache of video and channel metadata it has seen. Cached videos power search, recommendations, channel pages, and followed-channel browsing even when a feed cannot refresh later.
 
-This version does not use a YouTube Data API key. Searches check the local cache first, then the launcher can run no-key music-focused public web discovery, fall back to unauthenticated Piped/Invidious search mirrors when result pages are empty, import matching YouTube videos through oEmbed metadata, and cache only results that look like music. Creator searches can also find a YouTube `/channel/UC...` URL, refresh that channel's public RSS feed, and cache its videos. Daily recommendation playlists are built from cached metadata.
+This version does not use a YouTube Data API key. Searches check the local cache first, then the launcher can run no-key music-focused public web discovery, fall back to unauthenticated Piped/Invidious search mirrors when result pages are empty, import matching YouTube videos through oEmbed metadata, and cache only results that look like music. If Spotify credentials are configured, searches also use Spotify catalogue matches to show Spotify tracks and improve matching YouTube discovery. Creator searches can also find a YouTube `/channel/UC...` URL, refresh that channel's public RSS feed, and cache its videos. Daily recommendation playlists are built from cached metadata.
 
 Melodify also builds an in-memory local metadata matrix from cached titles, creators, tags, dates, duration hints, likes, and followed channels. The matrix improves cache search and recommendations without saving another large index to browser storage.
 
@@ -56,9 +56,23 @@ You can also paste any of these:
 
 When Melodify is opened with the local launcher, it exposes `GET /yt/discover?type=videos&q=...`, `GET /yt/discover?type=channels&q=...`, `GET /yt/oembed?url=...`, and `GET /yt/feed?channelId=UC...`. If you open `index.html` directly and the helper is not running, cached browsing still works, but discovery and feed refreshes ask you to use the `Melodify` Desktop or Start Menu shortcut.
 
+## Spotify
+
+Spotify support is optional. To enable Spotify catalogue search and in-app Spotify playback, create a Spotify app in the Spotify Developer Dashboard, add your Melodify URL as a redirect URI, then set these Render environment variables:
+
+- `SPOTIFY_CLIENT_ID`
+- `SPOTIFY_CLIENT_SECRET`
+- `SPOTIFY_MARKET`, optional, defaults to `US`
+
+The redirect URI must match the app URL exactly, for example `https://melodify-zo3o.onrender.com/`. If you also use the local launcher, add `http://127.0.0.1:8788/` as another redirect URI.
+
+After those variables are set and Render redeploys, Melodify shows a `Connect Spotify` button. Spotify playback uses Spotify's Web Playback SDK, so the person using the app must sign in with a Spotify Premium account. Without Premium, Melodify does not keep trying to use Spotify playback: Spotify track cards are hidden, failed Spotify playback is marked as YouTube-only for that browser, and Melodify searches for a matching YouTube music video instead.
+
 ## Platform limits
 
 Melodify uses YouTube's supported RSS feed and embedded player. It does not scrape YouTube HTML pages. YouTube does not allow apps to bypass private, deleted, geo-blocked, embed-disabled, or otherwise unavailable videos. YouTube also does not allow separating the audio stream from the video stream or playing YouTube content in a hidden background player, so Melodify keeps a visible YouTube player in the bottom bar.
+
+Spotify playback uses Spotify's official Web Playback SDK and a logged-in Premium account. If the signed-in account is not Premium, Melodify falls back to YouTube-only behavior. Melodify does not download Spotify songs or bypass Spotify account, device, market, Premium, or DRM limits.
 
 If a video fails with a YouTube playback error during autoplay, Melodify skips it for the current session and keeps the cached video available for later retry instead of permanently poisoning the cache.
 

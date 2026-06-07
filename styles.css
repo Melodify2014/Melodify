@@ -676,6 +676,52 @@ body:not(.has-current) .playerbar {
   line-height: 1.4;
 }
 
+.spotify-player-frame {
+  padding: 16px;
+  text-align: left;
+}
+
+.spotify-frame-copy {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+}
+
+.spotify-frame-copy img,
+.spotify-frame-copy > span {
+  width: 72px;
+  height: 72px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--surface-soft);
+}
+
+.spotify-frame-copy > span {
+  display: inline-grid;
+  place-items: center;
+  color: var(--green);
+}
+
+.spotify-frame-copy h3,
+.spotify-frame-copy p {
+  margin: 0;
+}
+
+.spotify-frame-copy h3 {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 0.95rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spotify-frame-copy p:last-child {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 .empty-player.hidden {
   display: none;
 }
@@ -1077,6 +1123,20 @@ svg {
     height: auto;
     max-height: 164px;
     aspect-ratio: 16 / 9;
+  }
+
+  .spotify-player-frame {
+    padding: 12px;
+  }
+
+  .spotify-frame-copy {
+    grid-template-columns: 58px minmax(0, 1fr);
+  }
+
+  .spotify-frame-copy img,
+  .spotify-frame-copy > span {
+    width: 58px;
+    height: 58px;
   }
 
   .track-panel {

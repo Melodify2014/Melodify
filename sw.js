@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "melodify-static-v40";
+const CACHE_NAME = "melodify-static-v42";
 const THUMBNAIL_CACHE_NAME = "melodify-thumbnails-v1";
 const APP_SHELL = [
   "./",
@@ -46,6 +46,7 @@ self.addEventListener("fetch", (event) => {
 
   if (url.origin !== location.origin) return;
   if (url.pathname.startsWith("/__melodify/")) return;
+  if (url.pathname.startsWith("/spotify/")) return;
   if (url.pathname === "/yt/feed" || url.pathname === "/yt/oembed" || url.pathname === "/yt/discover") return;
 
   event.respondWith(networkFirst(request, CACHE_NAME));
