@@ -2,7 +2,9 @@
 
 const STATE_STORAGE = "melodify-state-v1";
 const STATE_DB_NAME = "melodify-cache-v1";
+const STATE_DB_VERSION = 2;
 const STATE_DB_STORE = "records";
+const STATE_RECORDINGS_STORE = "recordings";
 const STATE_DB_KEY = "state";
 const FEED_PROXY_PATH = "/yt/feed";
 const OEMBED_PROXY_PATH = "/yt/oembed";
@@ -245,6 +247,7 @@ const state = {
   channelDiscoveryFetchedAt: {},
   creatorIndex: {},
   searchCache: {},
+  recordings: {},
   dailyPlaylists: { date: "", playlists: [] },
   unavailableVideos: {},
   sessionBlockedVideos: {},
@@ -258,6 +261,8 @@ let ytPlayer = null;
 let ytReady = false;
 let playerReady = false;
 let playerBlocked = false;
+let localRecordingUrl = "";
+let localRecordingLoading = false;
 let fileModeToastShown = false;
 let lastVisibleVideos = [];
 let metadataMatrix = null;
@@ -322,6 +327,7 @@ function cacheElements() {
   els.searchForm = document.getElementById("searchForm");
   els.searchInput = document.getElementById("searchInput");
   els.likedCount = document.getElementById("likedCount");
+  els.recordedCount = document.getElementById("recordedCount");
   els.followCount = document.getElementById("followCount");
   els.modalRoot = document.getElementById("modalRoot");
   els.toast = document.getElementById("toast");
@@ -366,6 +372,7 @@ function applySavedState(saved = {}) {
   state.channelDiscoveryFetchedAt = saved.channelDiscoveryFetchedAt || {};
   state.creatorIndex = saved.creatorIndex || {};
   state.searchCache = saved.searchCache || {};
+  state.recordings = saved.recordings || {};
   state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
   state.recommendedChannels = saved.recommendedChannels || [];
   state.unavailableVideos = saved.availabilityModelVersion === AVAILABILITY_MODEL_VERSION ? saved.unavailableVideos || {} : {};
@@ -400,6 +407,7 @@ function stateSnapshot() {
     channelDiscoveryFetchedAt: state.channelDiscoveryFetchedAt,
     creatorIndex: state.creatorIndex,
     searchCache: state.searchCache,
+    recordings: state.recordings,
     dailyPlaylists: state.dailyPlaylists,
     recommendedChannels: state.recommendedChannels,
     unavailableVideos: state.unavailableVideos,
@@ -417,6 +425,7 @@ function localStateSnapshot(snapshot) {
     loop: snapshot.loop,
     recommendations: snapshot.recommendations.slice(0, 30),
     recommendedChannels: snapshot.recommendedChannels.slice(0, 16),
+    recordings: snapshot.recordings,
     unavailableVideos: snapshot.unavailableVideos,
     availabilityModelVersion: snapshot.availabilityModelVersion,
     savedAt: snapshot.savedAt,
@@ -430,9 +439,11 @@ function openPersistentCacheDb() {
       reject(new Error("IndexedDB unavailable"));
       return;
     }
-    const request = indexedDB.open(STATE_DB_NAME, 1);
+    const request = indexedDB.open(STATE_DB_NAME, STATE_DB_VERSION);
     request.onupgradeneeded = () => {
-      request.result.createObjectStore(STATE_DB_STORE);
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STATE_DB_STORE)) db.createObjectStore(STATE_DB_STORE);
+      if (!db.objectStoreNames.contains(STATE_RECORDINGS_STORE)) db.createObjectStore(STATE_RECORDINGS_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("IndexedDB failed"));
@@ -474,6 +485,49 @@ async function writePersistentState(snapshot) {
     });
   } catch {
     // localStorage still keeps the small backup state when IndexedDB is unavailable.
+  }
+}
+
+async function saveRecordingBlob(videoId, file) {
+  if (!videoId || !file) return;
+  const db = await openPersistentCacheDb();
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(STATE_RECORDINGS_STORE, "readwrite");
+    const store = transaction.objectStore(STATE_RECORDINGS_STORE);
+    store.put({
+      id: videoId,
+      blob: file,
+      name: file.name || "",
+      type: file.type || "video/mp4",
+      size: file.size || 0,
+      savedAt: new Date().toISOString()
+    }, videoId);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error || new Error("Recording save failed"));
+    };
+  });
+}
+
+async function readRecordingBlob(videoId) {
+  if (!videoId) return null;
+  try {
+    const db = await openPersistentCacheDb();
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STATE_RECORDINGS_STORE, "readonly");
+      const store = transaction.objectStore(STATE_RECORDINGS_STORE);
+      const request = store.get(videoId);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error || new Error("Recording read failed"));
+      transaction.oncomplete = () => db.close();
+      transaction.onerror = () => db.close();
+    });
+  } catch {
+    return null;
   }
 }
 
@@ -545,6 +599,20 @@ function bindEvents() {
     event.preventDefault();
     await handleAction(actionTarget.dataset.action, actionTarget, event);
   });
+
+  window.addEventListener("offline", () => {
+    if (getRecordedVideos().length && (state.route === "home" || state.route === "search")) {
+      location.hash = "recorded";
+    } else {
+      render();
+    }
+    showToast("Offline mode: saved recordings can play without Wi-Fi.");
+  });
+
+  window.addEventListener("online", () => {
+    render();
+    showToast("Back online.");
+  });
 }
 
 async function handleAction(action, target, event) {
@@ -564,6 +632,12 @@ async function handleAction(action, target, event) {
   if (action === "like") {
     const video = findVideo(target.dataset.videoId);
     if (video) toggleLike(video);
+    return;
+  }
+
+  if (action === "attach-recording") {
+    const video = findVideo(target.dataset.videoId);
+    if (video) await attachRecording(video);
     return;
   }
 
@@ -644,11 +718,82 @@ async function handleAction(action, target, event) {
   }
 }
 
+async function attachRecording(video) {
+  if (!video?.id) return;
+  const file = await pickRecordingFile();
+  if (!file) return;
+  if (!looksLikeVideoFile(file)) {
+    showToast("Choose a video file for the recording.");
+    return;
+  }
+
+  try {
+    await saveRecordingBlob(video.id, file);
+  } catch {
+    showToast("Melodify could not save that recording. The browser storage may be full.");
+    return;
+  }
+
+  const compact = compactVideo({
+    ...video,
+    embeddable: true,
+    tags: uniqueStrings([...(video.tags || []), "recorded", "music video"])
+  });
+  state.recordings[video.id] = {
+    ...compact,
+    fileName: file.name || "recording",
+    fileType: file.type || "video/mp4",
+    fileSize: file.size || 0,
+    savedAt: new Date().toISOString()
+  };
+  cacheVideo({ ...compact, embeddable: true }, "recording", false);
+  markWatched(compact, false);
+  persist();
+  render();
+  showToast("Recording saved. It will play offline from Recorded.");
+}
+
+function pickRecordingFile() {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    let settled = false;
+    const finish = (file) => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      resolve(file || null);
+    };
+
+    input.type = "file";
+    input.accept = "video/*,.mp4,.webm,.m4v,.mov,.mkv";
+    input.style.position = "fixed";
+    input.style.left = "-9999px";
+    input.addEventListener("change", () => finish(input.files?.[0] || null), { once: true });
+    window.addEventListener("focus", () => {
+      window.setTimeout(() => {
+        if (!input.files?.length) finish(null);
+      }, 500);
+    }, { once: true });
+    document.body.append(input);
+    input.click();
+  });
+}
+
+function looksLikeVideoFile(file) {
+  if (!file) return false;
+  if (String(file.type || "").startsWith("video/")) return true;
+  return /\.(mp4|webm|m4v|mov|mkv)$/i.test(file.name || "");
+}
+
 function routeFromHash() {
   const hash = location.hash.replace(/^#/, "") || "home";
   const [route, channelId] = hash.split("/");
   state.route = route;
   state.activeChannelId = channelId ? decodeURIComponent(channelId) : "";
+  if (isOffline() && getRecordedVideos().length && (state.route === "home" || state.route === "search")) {
+    state.route = "recorded";
+    state.activeChannelId = "";
+  }
 }
 
 function render() {
@@ -663,6 +808,7 @@ function renderNav() {
     item.classList.toggle("active", item.dataset.nav === state.route);
   });
   els.likedCount.textContent = String(Object.keys(state.likedVideos).length);
+  if (els.recordedCount) els.recordedCount.textContent = String(getRecordedVideos().length);
   els.followCount.textContent = String(Object.keys(state.followedChannels).length);
 }
 
@@ -673,6 +819,8 @@ function renderView() {
     html = renderSearchView();
   } else if (state.route === "liked") {
     html = renderLikedView();
+  } else if (state.route === "recorded") {
+    html = renderRecordedView();
   } else if (state.route === "following") {
     html = renderFollowingView();
   } else if (state.route === "recommended") {
@@ -765,6 +913,23 @@ function renderLikedView() {
       <div>
         <p class="eyebrow">${videos.length} saved</p>
         <h1 class="view-title">Liked videos</h1>
+      </div>
+    </header>
+    ${renderVideoGrid(videos)}
+  `;
+}
+
+function renderRecordedView() {
+  const videos = getRecordedVideos();
+  lastVisibleVideos = videos;
+  if (!videos.length) {
+    return renderEmpty("Recorded", "Add a local recording to a video or Short, then it will play here without Wi-Fi.", "music");
+  }
+  return `
+    <header class="view-header">
+      <div>
+        <p class="eyebrow">${videos.length} offline recordings</p>
+        <h1 class="view-title">Recorded</h1>
       </div>
     </header>
     ${renderVideoGrid(videos)}
@@ -877,8 +1042,9 @@ function renderVideoGrid(videos) {
 function renderVideoCard(video) {
   const liked = isLiked(video.id);
   const channel = channelFromVideo(video);
-  const unavailable = !isPlayableVideo(video);
-  const status = unavailable ? "Unavailable" : video.duration || "Music video";
+  const recorded = hasRecording(video.id);
+  const unavailable = !recorded && !isPlayableVideo(video);
+  const status = recorded ? "Recorded" : unavailable ? "Unavailable" : video.duration || "Music video";
   return `
     <article class="video-card ${unavailable ? "unavailable" : ""}">
       <button class="thumb-button" type="button" data-action="${unavailable ? "noop" : "play"}" data-video-id="${escapeAttr(video.id)}" aria-label="Play ${escapeAttr(video.title)}" ${unavailable ? "disabled" : ""}>
@@ -893,6 +1059,9 @@ function renderVideoCard(video) {
       <div class="card-actions">
         <button class="mini-action ${liked ? "active" : ""}" type="button" data-action="like" data-video-id="${escapeAttr(video.id)}" aria-label="${liked ? "Unlike" : "Like"} ${escapeAttr(video.title)}" title="${liked ? "Unlike" : "Like"}">
           ${icon("heart")}
+        </button>
+        <button class="mini-action ${recorded ? "active" : ""}" type="button" data-action="attach-recording" data-video-id="${escapeAttr(video.id)}" aria-label="${recorded ? "Replace" : "Add"} offline recording for ${escapeAttr(video.title)}" title="${recorded ? "Replace recording" : "Add offline recording"}">
+          ${icon(recorded ? "check" : "plus")}
         </button>
         <button class="mini-action ${isFollowing(channel.id) ? "active" : ""}" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}" aria-label="Subscribe to ${escapeAttr(channel.title)}" title="Subscribe">
           ${icon(isFollowing(channel.id) ? "check" : "user-plus")}
@@ -965,9 +1134,11 @@ function renderStatus(title, message, iconName) {
 function renderPlayer() {
   const video = state.currentVideo;
   const hasVideo = Boolean(video);
+  const hasLocalRecording = hasVideo && hasRecording(video.id);
+  const hasEmbeddedPlayer = Boolean(ytPlayer || getLocalPlayer());
 
   document.body.classList.toggle("has-current", hasVideo);
-  els.playerSource.textContent = hasVideo ? "YouTube music video" : "Ready";
+  els.playerSource.textContent = hasVideo ? hasLocalRecording ? "Offline recording" : "YouTube music video" : "Ready";
   els.playerTitle.textContent = hasVideo ? video.title : "Choose a music video";
   els.playerChannel.textContent = hasVideo ? video.channelTitle : "Melodify";
   els.playerChannel.disabled = !hasVideo;
@@ -991,7 +1162,7 @@ function renderPlayer() {
   if (!hasVideo) {
     setPlayerPlaceholder();
   } else if (!playerBlocked) {
-    els.emptyPlayer.classList.toggle("hidden", Boolean(ytPlayer));
+    els.emptyPlayer.classList.toggle("hidden", hasEmbeddedPlayer);
   }
 }
 
@@ -2377,6 +2548,7 @@ function primeCache() {
   cacheChannels(Object.values(state.followedChannels), "saved", false);
   cacheChannels(state.recommendedChannels, "saved", false);
   cacheVideos(Object.values(state.likedVideos), "saved", false);
+  cacheVideos(Object.keys(state.recordings || {}).map(videoFromRecordingMetadata).filter(Boolean), "recording", false);
   cacheVideos(state.recommendations, "saved", false);
   for (const channel of Object.values(state.cachedChannels)) rememberCreatorQuery(channel.title, channel);
   for (const [channelId, ids] of Object.entries(state.channelVideoIds)) {
@@ -2394,7 +2566,7 @@ function primeCache() {
 function pruneNonMusicCache() {
   let changed = false;
   for (const [id, video] of Object.entries(state.videoCache)) {
-    if (!isLikelyMusicVideo(video)) {
+    if (!hasRecording(id) && !isLikelyMusicVideo(video)) {
       delete state.videoCache[id];
       delete state.likedVideos[id];
       changed = true;
@@ -2402,7 +2574,7 @@ function pruneNonMusicCache() {
   }
 
   for (const [id, video] of Object.entries(state.likedVideos)) {
-    if (!isLikelyMusicVideo(video)) {
+    if (!hasRecording(id) && !isLikelyMusicVideo(video)) {
       delete state.likedVideos[id];
       changed = true;
     }
@@ -2437,7 +2609,7 @@ function pruneNonMusicCache() {
     }
   }
 
-  if (state.currentVideo && !state.videoCache[state.currentVideo.id] && !isLikelyMusicVideo(state.currentVideo)) {
+  if (state.currentVideo && !hasRecording(state.currentVideo.id) && !state.videoCache[state.currentVideo.id] && !isLikelyMusicVideo(state.currentVideo)) {
     state.currentVideo = null;
     state.queue = [];
     state.queueIndex = -1;
@@ -2457,7 +2629,7 @@ function cacheVideos(videos, source = "seen", shouldPersist = true) {
 
 function cacheVideo(video, source = "seen", shouldPersist = true) {
   if (!video?.id) return;
-  if (source !== "demo" && !isLikelyMusicVideo(video)) return;
+  if (source !== "demo" && source !== "recording" && !isLikelyMusicVideo(video)) return;
   if (video.channelId) cacheChannel(channelFromVideo(video), source, false);
   const existing = state.videoCache[video.id] || {};
   const sources = new Set([...(existing.sources || []), source]);
@@ -2610,6 +2782,13 @@ async function playVideo(video, queue) {
   persist();
   if (removedRecommendation && state.route === "recommended") render();
   else renderPlayer();
+
+  if (hasRecording(video.id)) {
+    await playLocalRecording(video);
+    return;
+  }
+
+  if (getLocalPlayer()) resetPlayerElement();
   ensurePlayer();
 
   if (ytPlayer && playerReady) {
@@ -2618,7 +2797,13 @@ async function playVideo(video, queue) {
 }
 
 function ensurePlayer() {
-  if (!state.currentVideo || ytPlayer) return;
+  if (!state.currentVideo || ytPlayer || getLocalPlayer() || localRecordingLoading) return;
+  if (hasRecording(state.currentVideo.id)) {
+    playLocalRecording(state.currentVideo).catch(() => {
+      handleOfflinePlayer();
+    });
+    return;
+  }
   if (isOffline()) {
     handleOfflinePlayer();
     return;
@@ -2664,15 +2849,88 @@ function ensurePlayer() {
   renderPlayer();
 }
 
+async function playLocalRecording(video) {
+  if (!video?.id) return;
+  localRecordingLoading = true;
+  try {
+    const recording = await readRecordingBlob(video.id);
+    if (!recording?.blob) {
+      delete state.recordings[video.id];
+      persist();
+      render();
+      handleOfflinePlayer();
+      showToast("That recording is missing from browser storage.");
+      return;
+    }
+
+    destroyYouTubePlayer();
+    resetPlayerElement();
+    const localPlayer = document.createElement("video");
+    localRecordingUrl = URL.createObjectURL(recording.blob);
+    localPlayer.id = "local-player";
+    localPlayer.controls = true;
+    localPlayer.autoplay = true;
+    localPlayer.playsInline = true;
+    localPlayer.src = localRecordingUrl;
+    localPlayer.addEventListener("play", () => {
+      state.isPlaying = true;
+      renderPlayer();
+    });
+    localPlayer.addEventListener("pause", () => {
+      state.isPlaying = false;
+      renderPlayer();
+    });
+    localPlayer.addEventListener("ended", () => {
+      state.isPlaying = false;
+      handlePlayerEnded();
+      renderPlayer();
+    });
+    localPlayer.addEventListener("error", () => {
+      state.isPlaying = false;
+      playerBlocked = true;
+      resetPlayerElement();
+      setPlayerFallback("Recording cannot play", "Try replacing this saved recording with a different video file.", 0);
+      renderPlayer();
+    });
+
+    playerReady = true;
+    playerBlocked = false;
+    els.emptyPlayer.before(localPlayer);
+    els.emptyPlayer.classList.add("hidden");
+    try {
+      await localPlayer.play();
+      state.isPlaying = true;
+    } catch {
+      state.isPlaying = false;
+    }
+    renderPlayer();
+  } finally {
+    localRecordingLoading = false;
+  }
+}
+
+function getLocalPlayer() {
+  return document.getElementById("local-player");
+}
+
+function destroyYouTubePlayer() {
+  if (ytPlayer && typeof ytPlayer.destroy === "function") {
+    try {
+      ytPlayer.destroy();
+    } catch {}
+  }
+  ytPlayer = null;
+}
+
 function handleOfflinePlayer() {
   playerBlocked = true;
   resetPlayerElement();
   setPlayerFallback(
-    "Offline playback needs internet",
-    "Melodify can open cached lists and thumbnails offline, but YouTube videos still stream from YouTube.",
+    "No saved recording for this video",
+    "Open Recorded to play saved files offline, or add a local recording to this video while you have the file.",
     0
   );
-  showToast("Cached Melodify pages work offline. YouTube playback needs Wi-Fi.");
+  showToast("This YouTube item needs Wi-Fi unless you add a recording.");
 }
 
 function handleFileModePlayer() {
@@ -2706,6 +2964,12 @@ function createPlayerIframe(videoId, playerVars) {
 function resetPlayerElement() {
   const existing = document.getElementById("youtube-player");
   if (existing) existing.remove();
+  const localPlayer = getLocalPlayer();
+  if (localPlayer) localPlayer.remove();
+  if (localRecordingUrl) {
+    URL.revokeObjectURL(localRecordingUrl);
+    localRecordingUrl = "";
+  }
   playerReady = false;
 }
 
@@ -2728,12 +2992,7 @@ function handlePlayerError(code) {
   }
 
   playerBlocked = true;
-  if (ytPlayer && typeof ytPlayer.destroy === "function") {
-    try {
-      ytPlayer.destroy();
-    } catch {}
-  }
-  ytPlayer = null;
+  destroyYouTubePlayer();
   resetPlayerElement();
 
   const fileMessage = window.location.protocol === "file:"
@@ -2781,6 +3040,15 @@ function togglePlayback() {
   }
 
   ensurePlayer();
+  const localPlayer = getLocalPlayer();
+  if (localPlayer) {
+    if (localPlayer.paused) {
+      localPlayer.play().catch(() => {});
+    } else {
+      localPlayer.pause();
+    }
+    return;
+  }
   if (!ytPlayer || !playerReady) return;
   if (state.isPlaying) {
     ytPlayer.pauseVideo();
@@ -2790,9 +3058,15 @@ function togglePlayback() {
 }
 
 function handlePlayerEnded() {
+  const localPlayer = getLocalPlayer();
   if (state.loop) {
-    ytPlayer.seekTo(0);
-    ytPlayer.playVideo();
+    if (localPlayer) {
+      localPlayer.currentTime = 0;
+      localPlayer.play().catch(() => {});
+    } else if (ytPlayer) {
+      ytPlayer.seekTo(0);
+      ytPlayer.playVideo();
+    }
     return;
   }
   if (playAdjacent(1, { silent: true })) return;
@@ -2827,17 +3101,19 @@ function fallbackPlaybackQueue() {
     ? state.searchResults.videos
     : state.route === "recommended"
       ? state.recommendations
-      : state.route === "liked"
-        ? Object.values(state.likedVideos)
-        : state.route === "channel"
-          ? channelVideos(state.activeChannelId)
+    : state.route === "liked"
+      ? Object.values(state.likedVideos)
+      : state.route === "channel"
+        ? channelVideos(state.activeChannelId)
+        : state.route === "recorded"
+          ? getRecordedVideos()
           : [];
   return uniqueVideos([
     ...state.queue,
     ...lastVisibleVideos,
     ...routeVideos,
     ...demoVideos
-  ]).filter((video) => isPlayableVideo(video) && isLikelyMusicVideo(video));
+  ]).filter((video) => isPlayableVideo(video) && (hasRecording(video.id) || isLikelyMusicVideo(video)));
 }
 
 function findNextPlayableIndex(direction) {
@@ -2889,6 +3165,41 @@ function channelFromVideo(video) {
   };
 }
 
+function hasRecording(videoId) {
+  return Boolean(videoId && state.recordings?.[videoId]);
+}
+
+function getRecordedVideos() {
+  return Object.keys(state.recordings || {})
+    .map((id) => findVideo(id) || videoFromRecordingMetadata(id))
+    .filter(Boolean)
+    .sort((a, b) => recordingSortValue(b.id) - recordingSortValue(a.id));
+}
+
+function recordingSortValue(videoId) {
+  return Date.parse(state.recordings?.[videoId]?.savedAt || state.watchedVideos?.[videoId]?.watchedAt || 0) || 0;
+}
+
+function videoFromRecordingMetadata(id) {
+  const recording = state.recordings?.[id];
+  if (!recording) return null;
+  return {
+    id,
+    title: recording.title || recording.fileName || "Recorded video",
+    channelId: recording.channelId || "",
+    channelTitle: recording.channelTitle || "Recorded",
+    thumbnail: recording.thumbnail || "",
+    publishedAt: recording.publishedAt || "",
+    duration: recording.duration || "",
+    durationSeconds: Number(recording.durationSeconds || 0),
+    embeddable: true,
+    isShort: Boolean(recording.isShort),
+    categoryId: recording.categoryId || MUSIC_CATEGORY_ID,
+    tags: uniqueStrings([...(recording.tags || []), "recorded", "music video"]),
+    watchUrl: recording.watchUrl || `https://www.youtube.com/watch?v=${encodeURIComponent(id)}`
+  };
+}
+
 function findVideo(id) {
   if (!id) return null;
   return (
@@ -2898,6 +3209,7 @@ function findVideo(id) {
     state.recommendations.find((video) => video.id === id) ||
     Object.values(state.channelCache).flatMap((cache) => cache.videos || []).find((video) => video.id === id) ||
     demoVideos.find((video) => video.id === id) ||
+    videoFromRecordingMetadata(id) ||
     null
   );
 }
@@ -2974,7 +3286,7 @@ function isUnavailable(videoId) {
 }
 
 function isPlayableVideo(video) {
-  return Boolean(video?.id) && !isUnavailable(video.id);
+  return Boolean(video?.id) && (hasRecording(video.id) || !isUnavailable(video.id));
 }
 
 function getLocalRecommendations() {
