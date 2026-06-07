@@ -337,6 +337,8 @@ function cacheElements() {
   els.playerChannel = document.getElementById("playerChannel");
   els.playButtonIcon = document.getElementById("playButtonIcon");
   els.loopButton = document.getElementById("loopButton");
+  els.playerRecording = document.getElementById("playerRecording");
+  els.playerRecordingIcon = document.getElementById("playerRecordingIcon");
   els.playerLike = document.getElementById("playerLike");
   els.playerSubscribe = document.getElementById("playerSubscribe");
   els.youtubeLink = document.getElementById("youtubeLink");
@@ -702,6 +704,11 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "current-recording" && state.currentVideo) {
+    await attachRecording(state.currentVideo);
+    return;
+  }
+
   if (action === "current-like" && state.currentVideo) {
     toggleLike(state.currentVideo);
     return;
@@ -752,6 +759,10 @@ async function attachRecording(video) {
   persist();
   render();
   showToast("Recording saved. It will play offline from Recorded.");
+  if (state.currentVideo?.id === compact.id) {
+    state.currentVideo = compact;
+    await playLocalRecording(compact);
+  }
 }
 
 function pickRecordingFile() {
@@ -1156,6 +1167,11 @@ function renderPlayer() {
   els.trackArt.style.backgroundImage = hasVideo ? `url("${video.thumbnail}")` : "";
   els.playButtonIcon.innerHTML = icon(state.isPlaying ? "pause" : "play");
   els.loopButton.classList.toggle("active", state.loop);
+  els.playerRecording.disabled = !hasVideo;
+  els.playerRecording.classList.toggle("active", hasLocalRecording);
+  els.playerRecording.title = hasLocalRecording ? "Replace offline recording" : "Add offline recording";
+  els.playerRecording.setAttribute("aria-label", hasVideo ? `${hasLocalRecording ? "Replace" : "Add"} offline recording for ${video.title}` : "Add offline recording");
+  els.playerRecordingIcon.innerHTML = icon(hasLocalRecording ? "check" : "plus");
   els.playerLike.disabled = !hasVideo;
   els.playerSubscribe.disabled = !hasVideo;
   els.youtubeLink.href = hasVideo ? `https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}` : "https://www.youtube.com";
