@@ -144,6 +144,10 @@ a {
   text-align: center;
 }
 
+body:not(.is-offline) [data-nav="recorded"] {
+  display: none;
+}
+
 .sidebar-footer {
   display: grid;
   gap: 12px;
@@ -968,6 +972,10 @@ svg {
     gap: 2px;
     height: 100%;
     margin-top: 0;
+  }
+
+  body:not(.is-offline) .nav-stack {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .nav-item,

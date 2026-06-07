@@ -610,6 +610,7 @@ function bindEvents() {
   });
 
   window.addEventListener("online", () => {
+    routeFromHash();
     render();
     showToast("Back online.");
   });
@@ -790,6 +791,11 @@ function routeFromHash() {
   const [route, channelId] = hash.split("/");
   state.route = route;
   state.activeChannelId = channelId ? decodeURIComponent(channelId) : "";
+  if (!isOffline() && state.route === "recorded") {
+    state.route = "home";
+    state.activeChannelId = "";
+    if (location.hash === "#recorded") history.replaceState(null, "", "#home");
+  }
   if (isOffline() && getRecordedVideos().length && (state.route === "home" || state.route === "search")) {
     state.route = "recorded";
     state.activeChannelId = "";
@@ -797,10 +803,15 @@ function routeFromHash() {
 }
 
 function render() {
+  updateConnectionState();
   installIcons(document);
   renderNav();
   renderPlayer();
   renderView();
+}
+
+function updateConnectionState() {
+  document.body.classList.toggle("is-offline", isOffline());
 }
 
 function renderNav() {
@@ -819,7 +830,7 @@ function renderView() {
     html = renderSearchView();
   } else if (state.route === "liked") {
     html = renderLikedView();
-  } else if (state.route === "recorded") {
+  } else if (state.route === "recorded" && isOffline()) {
     html = renderRecordedView();
   } else if (state.route === "following") {
     html = renderFollowingView();

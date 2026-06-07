@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "melodify-static-v38";
+const CACHE_NAME = "melodify-static-v39";
 const THUMBNAIL_CACHE_NAME = "melodify-thumbnails-v1";
 const APP_SHELL = [
   "./",
@@ -8,7 +8,10 @@ const APP_SHELL = [
   "./styles.css",
   "./app.js",
   "./manifest.webmanifest",
-  "./icons/icon.svg"
+  "./icons/icon.svg",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
+  "./icons/apple-touch-icon.png"
 ];
 
 self.addEventListener("install", (event) => {
