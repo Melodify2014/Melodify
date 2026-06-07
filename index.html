@@ -2,8 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#0b0d0c">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Melodify">
     <meta name="referrer" content="strict-origin-when-cross-origin">
     <title>Melodify</title>
     <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -54,7 +57,7 @@
           <form class="search-form" id="searchForm" role="search">
             <label class="search-box" for="searchInput">
               <span data-icon="search" aria-hidden="true"></span>
-              <input id="searchInput" name="q" type="search" autocomplete="off" placeholder="Search music videos or creators">
+              <input id="searchInput" name="q" type="search" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="search" placeholder="Search music videos or creators">
             </label>
             <div class="segmented" role="group" aria-label="Search type">
               <button type="button" class="segment active" data-filter="all">All</button>
@@ -91,11 +94,11 @@
         <button class="icon-button" type="button" id="loopButton" data-action="toggle-loop" aria-label="Loop" title="Loop">
           <span data-icon="loop" aria-hidden="true"></span>
         </button>
-        <button class="pill-action" type="button" id="playerLike" data-action="current-like" disabled>
+        <button class="pill-action" type="button" id="playerLike" data-action="current-like" aria-label="Like current video" disabled>
           <span data-icon="heart" aria-hidden="true"></span>
           <span>Like</span>
         </button>
-        <button class="pill-action" type="button" id="playerSubscribe" data-action="current-subscribe" disabled>
+        <button class="pill-action" type="button" id="playerSubscribe" data-action="current-subscribe" aria-label="Subscribe to current creator" disabled>
           <span data-icon="user-plus" aria-hidden="true"></span>
           <span>Subscribe</span>
         </button>

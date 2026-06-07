@@ -3,7 +3,9 @@
   "short_name": "Melodify",
   "description": "A Spotify-style YouTube music video player with likes, following, channel pages, and recommendations.",
   "start_url": "./index.html",
+  "scope": "./",
   "display": "standalone",
+  "orientation": "portrait",
   "background_color": "#070807",
   "theme_color": "#0b0d0c",
   "icons": [
