@@ -1,6 +1,9 @@
 "use strict";
 
 const STATE_STORAGE = "melodify-state-v1";
+const STATE_DB_NAME = "melodify-cache-v1";
+const STATE_DB_STORE = "records";
+const STATE_DB_KEY = "state";
 const FEED_PROXY_PATH = "/yt/feed";
 const OEMBED_PROXY_PATH = "/yt/oembed";
 const DISCOVERY_PROXY_PATH = "/yt/discover";
@@ -8,7 +11,7 @@ const APP_VERSION_PATH = "/__melodify/version";
 const APP_RESTART_PATH = "/__melodify/restart";
 const MUSIC_CATEGORY_ID = "10";
 const PLAYER_UNAVAILABLE_ERRORS = new Set([2, 5, 100, 101, 150]);
-const SEARCH_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SEARCH_CACHE_TTL_MS = Number.POSITIVE_INFINITY;
 const CHANNEL_CACHE_TTL_MS = 60 * 60 * 1000;
 const FOLLOWED_CHANNEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const CHANNEL_PAGE_AUTO_REFRESH_RETRY_MS = 2 * 60 * 1000;
@@ -29,7 +32,7 @@ const SEARCH_CACHE_CHANNEL_RESULT_LIMIT = 12;
 const RECOMMENDATION_DISCOVERY_QUERY_LIMIT = 5;
 const RECOMMENDATION_CHANNEL_QUERY_LIMIT = 4;
 const RECOMMENDATION_IMPORT_LIMIT = 16;
-const WATCH_HISTORY_LIMIT = 1200;
+const WATCH_HISTORY_LIMIT = Number.POSITIVE_INFINITY;
 const AVAILABILITY_MODEL_VERSION = 2;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
@@ -274,12 +277,18 @@ window.onYouTubeIframeAPIReady = () => {
   ensurePlayer();
 };
 
-document.addEventListener("DOMContentLoaded", init);
+document.addEventListener("DOMContentLoaded", () => {
+  init().catch(() => {
+    try {
+      showToast("Melodify cache could not finish loading.");
+    } catch {}
+  });
+});
 
-function init() {
+async function init() {
   cacheElements();
   redirectFileModeToLocalApp();
-  hydrateState();
+  await hydrateState();
   primeCache();
   pruneNonMusicCache();
   installIcons(document);
@@ -287,6 +296,7 @@ function init() {
   routeFromHash();
   render();
   registerServiceWorker();
+  requestPersistentStorage();
   startAppUpdateWatcher();
   startFollowedChannelRefreshWatcher();
 
@@ -327,26 +337,11 @@ function cacheElements() {
   els.emptyPlayer = document.getElementById("emptyPlayer");
 }
 
-function hydrateState() {
+async function hydrateState() {
   try {
-    const saved = JSON.parse(localStorage.getItem(STATE_STORAGE) || "{}");
-    state.likedVideos = saved.likedVideos || {};
-    state.watchedVideos = saved.watchedVideos || {};
-    state.followedChannels = saved.followedChannels || {};
-    state.currentVideo = saved.currentVideo || null;
-    state.loop = Boolean(saved.loop);
-    state.recommendations = saved.recommendations || [];
-    state.videoCache = saved.videoCache || {};
-    state.cachedChannels = saved.cachedChannels || {};
-    state.channelVideoIds = saved.channelVideoIds || {};
-    state.channelFetchedAt = saved.channelFetchedAt || {};
-    state.channelFeedErrors = saved.channelFeedErrors || {};
-    state.channelDiscoveryFetchedAt = saved.channelDiscoveryFetchedAt || {};
-    state.creatorIndex = saved.creatorIndex || {};
-    state.searchCache = saved.searchCache || {};
-    state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
-    state.recommendedChannels = saved.recommendedChannels || [];
-    state.unavailableVideos = saved.availabilityModelVersion === AVAILABILITY_MODEL_VERSION ? saved.unavailableVideos || {} : {};
+    const localSaved = JSON.parse(localStorage.getItem(STATE_STORAGE) || "{}");
+    const saved = await readPersistentState() || localSaved;
+    applySavedState(saved);
     if (saved.availabilityModelVersion !== AVAILABILITY_MODEL_VERSION) {
       reEnableCachedVideos();
       persist();
@@ -356,33 +351,139 @@ function hydrateState() {
   }
 }
 
+function applySavedState(saved = {}) {
+  state.likedVideos = saved.likedVideos || {};
+  state.watchedVideos = saved.watchedVideos || {};
+  state.followedChannels = saved.followedChannels || {};
+  state.currentVideo = saved.currentVideo || null;
+  state.loop = Boolean(saved.loop);
+  state.recommendations = saved.recommendations || [];
+  state.videoCache = saved.videoCache || {};
+  state.cachedChannels = saved.cachedChannels || {};
+  state.channelVideoIds = saved.channelVideoIds || {};
+  state.channelFetchedAt = saved.channelFetchedAt || {};
+  state.channelFeedErrors = saved.channelFeedErrors || {};
+  state.channelDiscoveryFetchedAt = saved.channelDiscoveryFetchedAt || {};
+  state.creatorIndex = saved.creatorIndex || {};
+  state.searchCache = saved.searchCache || {};
+  state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
+  state.recommendedChannels = saved.recommendedChannels || [];
+  state.unavailableVideos = saved.availabilityModelVersion === AVAILABILITY_MODEL_VERSION ? saved.unavailableVideos || {} : {};
+}
+
 function persist() {
+  const snapshot = stateSnapshot();
+  writePersistentState(snapshot);
   try {
     localStorage.setItem(
       STATE_STORAGE,
-      JSON.stringify({
-        likedVideos: state.likedVideos,
-        watchedVideos: compactWatchedVideos(state.watchedVideos),
-        followedChannels: state.followedChannels,
-        currentVideo: state.currentVideo,
-        loop: state.loop,
-        recommendations: state.recommendations.slice(0, 30),
-        videoCache: state.videoCache,
-        cachedChannels: state.cachedChannels,
-        channelVideoIds: state.channelVideoIds,
-        channelFetchedAt: state.channelFetchedAt,
-        channelFeedErrors: state.channelFeedErrors,
-        channelDiscoveryFetchedAt: state.channelDiscoveryFetchedAt,
-        creatorIndex: state.creatorIndex,
-        searchCache: state.searchCache,
-        dailyPlaylists: state.dailyPlaylists,
-        recommendedChannels: state.recommendedChannels.slice(0, 16),
-        unavailableVideos: state.unavailableVideos,
-        availabilityModelVersion: AVAILABILITY_MODEL_VERSION
-      })
+      JSON.stringify(localStateSnapshot(snapshot))
     );
   } catch {
-    showToast("Melodify cache is full in this browser. Older browser storage may need clearing.");
+    showToast("Melodify saved the large cache, but the tiny backup cache is full.");
+  }
+}
+
+function stateSnapshot() {
+  return {
+    likedVideos: state.likedVideos,
+    watchedVideos: compactWatchedVideos(state.watchedVideos),
+    followedChannels: state.followedChannels,
+    currentVideo: state.currentVideo,
+    loop: state.loop,
+    recommendations: state.recommendations,
+    videoCache: state.videoCache,
+    cachedChannels: state.cachedChannels,
+    channelVideoIds: state.channelVideoIds,
+    channelFetchedAt: state.channelFetchedAt,
+    channelFeedErrors: state.channelFeedErrors,
+    channelDiscoveryFetchedAt: state.channelDiscoveryFetchedAt,
+    creatorIndex: state.creatorIndex,
+    searchCache: state.searchCache,
+    dailyPlaylists: state.dailyPlaylists,
+    recommendedChannels: state.recommendedChannels,
+    unavailableVideos: state.unavailableVideos,
+    availabilityModelVersion: AVAILABILITY_MODEL_VERSION,
+    savedAt: new Date().toISOString()
+  };
+}
+
+function localStateSnapshot(snapshot) {
+  return {
+    likedVideos: snapshot.likedVideos,
+    watchedVideos: snapshot.watchedVideos,
+    followedChannels: snapshot.followedChannels,
+    currentVideo: snapshot.currentVideo,
+    loop: snapshot.loop,
+    recommendations: snapshot.recommendations.slice(0, 30),
+    recommendedChannels: snapshot.recommendedChannels.slice(0, 16),
+    unavailableVideos: snapshot.unavailableVideos,
+    availabilityModelVersion: snapshot.availabilityModelVersion,
+    savedAt: snapshot.savedAt,
+    largeCacheStoredIn: "IndexedDB"
+  };
+}
+
+function openPersistentCacheDb() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const request = indexedDB.open(STATE_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(STATE_DB_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB failed"));
+  });
+}
+
+async function readPersistentState() {
+  try {
+    const db = await openPersistentCacheDb();
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STATE_DB_STORE, "readonly");
+      const store = transaction.objectStore(STATE_DB_STORE);
+      const request = store.get(STATE_DB_KEY);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error || new Error("Cache read failed"));
+      transaction.oncomplete = () => db.close();
+      transaction.onerror = () => db.close();
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function writePersistentState(snapshot) {
+  try {
+    const db = await openPersistentCacheDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STATE_DB_STORE, "readwrite");
+      const store = transaction.objectStore(STATE_DB_STORE);
+      store.put(snapshot, STATE_DB_KEY);
+      transaction.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error || new Error("Cache write failed"));
+      };
+    });
+  } catch {
+    // localStorage still keeps the small backup state when IndexedDB is unavailable.
+  }
+}
+
+async function requestPersistentStorage() {
+  try {
+    if (!navigator.storage?.persist) return;
+    const alreadyPersistent = await navigator.storage.persisted();
+    if (!alreadyPersistent) await navigator.storage.persist();
+  } catch {
+    // Browsers can deny persistent storage; Melodify still uses the largest cache it can.
   }
 }
 
@@ -996,6 +1097,15 @@ async function runSearch(query, filter, options = {}) {
     state.loading = false;
     render();
     if (state.error) showToast(state.error);
+    return;
+  }
+
+  if (isOffline()) {
+    state.searchResults = local;
+    state.error = local.videos.length || local.channels.length ? "" : "No internet connection. Cached Melodify results still work, but new YouTube discovery needs Wi-Fi.";
+    state.loading = false;
+    render();
+    showToast(state.error || "Showing saved offline cache.");
     return;
   }
 
@@ -2020,6 +2130,10 @@ function isFileMode() {
   return window.location.protocol === "file:";
 }
 
+function isOffline() {
+  return navigator.onLine === false;
+}
+
 function channelFeedStatus(channelId) {
   if (!isRssChannelId(channelId)) return "Cached";
   if (state.channelFeedErrors[channelId]) return "Feed unavailable";
@@ -2504,7 +2618,12 @@ async function playVideo(video, queue) {
 }
 
 function ensurePlayer() {
-  if (!ytReady || ytPlayer || !state.currentVideo) return;
+  if (!state.currentVideo || ytPlayer) return;
+  if (isOffline()) {
+    handleOfflinePlayer();
+    return;
+  }
+  if (!ytReady) return;
   if (window.location.protocol === "file:") {
     handleFileModePlayer();
     return;
@@ -2543,6 +2662,17 @@ function ensurePlayer() {
     }
   });
   renderPlayer();
+}
+
+function handleOfflinePlayer() {
+  playerBlocked = true;
+  resetPlayerElement();
+  setPlayerFallback(
+    "Offline playback needs internet",
+    "Melodify can open cached lists and thumbnails offline, but YouTube videos still stream from YouTube.",
+    0
+  );
+  showToast("Cached Melodify pages work offline. YouTube playback needs Wi-Fi.");
 }
 
 function handleFileModePlayer() {
