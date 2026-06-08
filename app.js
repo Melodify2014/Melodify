@@ -26,6 +26,13 @@ const LOCAL_APP_HELP = "Open Melodify from the Desktop or Start Menu shortcut to
 const LOCAL_PLAYER_HELP = "Open Melodify from the Desktop or Start Menu shortcut to play YouTube videos inside the app.";
 const SEARCH_DISCOVERY_TIMEOUT_MS = 7000;
 const SPOTIFY_SEARCH_TIMEOUT_MS = 4500;
+const MAX_SEARCH_QUERY_LENGTH = 160;
+const CATALOG_SEARCH_MIN_LINES = 10;
+const CATALOG_SEARCH_MAX_TITLES = 80;
+const SEARCH_FILLER_TOKENS = new Set([
+  "official", "video", "music", "views", "month", "months", "year", "years", "slowed", "reverb",
+  "super", "brazilian", "phonk", "montagem", "audio", "song", "edit", "lyrics", "topic"
+]);
 const SPOTIFY_AUTH_STORAGE = "melodify-spotify-auth-v1";
 const SPOTIFY_PKCE_STORAGE = "melodify-spotify-pkce-v1";
 const SPOTIFY_SCOPES = [
@@ -596,14 +603,13 @@ function bindEvents() {
 
   els.searchForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const query = els.searchInput.value.trim();
-    if (!query) {
-      showToast("Type a music video or creator first.");
-      return;
-    }
-    state.query = query;
-    location.hash = "search";
-    await runSearch(query, state.filter);
+    await submitSearchInput();
+  });
+
+  els.searchInput.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    await submitSearchInput();
   });
 
   document.querySelectorAll("[data-filter]").forEach((button) => {
@@ -650,6 +656,22 @@ function bindEvents() {
     render();
     showToast("Back online.");
   });
+}
+
+async function submitSearchInput() {
+  const prepared = prepareSearchQuery(els.searchInput.value);
+  const query = prepared.query;
+  if (!query) {
+    showToast("Type a music video or creator first.");
+    return;
+  }
+  if (prepared.compacted) {
+    els.searchInput.value = query;
+    showToast("Shortened pasted catalog into a faster music search.");
+  }
+  state.query = query;
+  location.hash = "search";
+  await runSearch(query, state.filter);
 }
 
 async function handleAction(action, target, event) {
@@ -834,6 +856,146 @@ function looksLikeVideoFile(file) {
   if (!file) return false;
   if (String(file.type || "").startsWith("video/")) return true;
   return /\.(mp4|webm|m4v|mov|mkv)$/i.test(file.name || "");
+}
+
+function prepareSearchQuery(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return { query: "", compacted: false };
+
+  const singleLine = raw.replace(/\s+/g, " ").trim();
+  if (parseYoutubeVideoId(raw) || parseChannelId(raw)) {
+    return { query: singleLine, compacted: singleLine !== raw };
+  }
+  const catalogText = normalizeCatalogSearchText(raw);
+  if (singleLine.length <= MAX_SEARCH_QUERY_LENGTH && !looksLikeCatalogSearchInput(raw) && !looksLikeCatalogSearchInput(catalogText)) {
+    return { query: singleLine, compacted: false };
+  }
+
+  const compacted = compactCatalogSearchInput(raw) || compactCatalogSearchInput(catalogText) || compactLongSearchInput(catalogText);
+  return {
+    query: compacted,
+    compacted: compacted !== singleLine
+  };
+}
+
+function normalizeCatalogSearchText(value) {
+  return String(value || "")
+    .replace(/(\d{1,2}:\d{2})(?=[^\s\d:])/g, "$1\n")
+    .replace(/([^\s])((?:\d+(?:\.\d+)?\s*[KMB]?|No)\s+views?)/gi, "$1\n$2")
+    .replace(/(views?)(?:â€¢|•)?(?=\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)/gi, "$1\n")
+    .replace(/(ago)(?=\d{1,2}:\d{2})/gi, "$1\n");
+}
+
+function compactCatalogSearchInput(value) {
+  const lines = splitCatalogSearchLines(value);
+  if (!looksLikeCatalogSearchInput(value, lines)) return "";
+
+  const titles = catalogSearchTitleLines(lines).slice(0, CATALOG_SEARCH_MAX_TITLES);
+  const titleText = titles.join(" ");
+  const creators = topCatalogCreatorNames(titles, 1);
+  const genres = catalogGenreTerms(titleText);
+  const titleHints = creators.length ? [] : topCatalogTitleHints(titles, 2);
+  return uniqueStrings([...creators, ...genres.slice(0, 1), ...titleHints, "music"])
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SEARCH_QUERY_LENGTH);
+}
+
+function compactLongSearchInput(value) {
+  const genres = catalogGenreTerms(value);
+  const tokens = tokenize(value).filter((token) => !isSearchFillerToken(token));
+  return uniqueStrings([...tokens.slice(0, 8), ...genres, "music"])
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SEARCH_QUERY_LENGTH);
+}
+
+function looksLikeCatalogSearchInput(value, preparedLines = null) {
+  const lines = preparedLines || splitCatalogSearchLines(value);
+  if (lines.length < CATALOG_SEARCH_MIN_LINES) return false;
+  const durationCount = lines.filter(isCatalogDurationLine).length;
+  const viewsCount = lines.filter(isCatalogViewsLine).length;
+  const ageCount = lines.filter(isCatalogAgeLine).length;
+  return durationCount >= 3 && (viewsCount >= 3 || ageCount >= 3) && catalogSearchTitleLines(lines).length >= 3;
+}
+
+function splitCatalogSearchLines(value) {
+  return String(value || "")
+    .split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function catalogSearchTitleLines(lines) {
+  return (lines || []).filter((line) => {
+    if (isCatalogMetadataLine(line)) return false;
+    if (/^and\s+(?:\d+\s+more|[A-Z0-9 ._-]{2,30})$/i.test(line)) return false;
+    if (/^(?:shorts|videos|play all|sort by|latest|popular)$/i.test(line)) return false;
+    if (/^ð/i.test(line)) return false;
+    return line.length >= 5;
+  });
+}
+
+function isCatalogMetadataLine(line) {
+  return isCatalogDurationLine(line) || isCatalogViewsLine(line) || isCatalogAgeLine(line) || /^(?:â€¢|•)$/.test(line);
+}
+
+function isCatalogDurationLine(line) {
+  return /^\d{1,2}:\d{2}(?::\d{2})?$/.test(line);
+}
+
+function isCatalogViewsLine(line) {
+  return /^(?:[\d,.]+\s*[KMB]?|No)\s+views?$/i.test(line);
+}
+
+function isCatalogAgeLine(line) {
+  return /^\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago$/i.test(line);
+}
+
+function topCatalogCreatorNames(titles, limit) {
+  const counts = new Map();
+  for (const title of titles || []) {
+    const beforeTilde = String(title).split("~")[0] || "";
+    const match = beforeTilde.match(/[-–—]\s*([^()[\]]+)/);
+    if (!match) continue;
+    for (const part of match[1].split(/,|&|\+|\band\b|\sx\s/gi)) {
+      const name = part.replace(/\s+/g, " ").trim();
+      const key = normalizeCreatorKey(name);
+      if (!key || isSearchFillerToken(key) || key.length < 2 || key.length > 32) continue;
+      counts.set(key, { name, count: (counts.get(key)?.count || 0) + 1 });
+    }
+  }
+  return [...counts.values()]
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, limit)
+    .map((item) => item.name.toLowerCase());
+}
+
+function catalogGenreTerms(text) {
+  const lower = String(text || "").toLowerCase();
+  if (lower.includes("brazilian phonk")) return ["brazilian phonk"];
+  return uniqueStrings(queryGenreTerms(text).filter((term) => term.length > 2)).slice(0, 1);
+}
+
+function topCatalogTitleHints(titles, limit) {
+  const counts = new Map();
+  for (const title of titles || []) {
+    const titlePart = String(title).split(/[-–—~(\[]/)[0] || "";
+    for (const token of tokenize(titlePart)) {
+      if (isSearchFillerToken(token) || token.length < 4) continue;
+      counts.set(token, (counts.get(token) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([token]) => token);
+}
+
+function isSearchFillerToken(token) {
+  return SEARCH_FILLER_TOKENS.has(String(token || "").toLowerCase());
 }
 
 async function hydrateSpotify() {
