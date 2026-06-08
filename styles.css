@@ -636,6 +636,17 @@ body:not(.is-offline) [data-nav="recorded"] {
   transform: translateY(-1px);
 }
 
+.mini-action:disabled {
+  cursor: default;
+  opacity: 0.34;
+  transform: none;
+}
+
+.mini-action:disabled:hover {
+  background: transparent;
+  color: var(--muted);
+}
+
 .danger-action:hover {
   background: rgba(255, 92, 116, 0.12);
   color: #ff7b8f;
@@ -1198,7 +1209,7 @@ body:not(.has-current) .playerbar {
 
 .queue-row {
   display: grid;
-  grid-template-columns: 34px 64px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   width: 100%;
@@ -1208,7 +1219,6 @@ body:not(.has-current) .playerbar {
   border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.04);
   color: var(--text);
-  cursor: pointer;
   text-align: left;
 }
 
@@ -1216,6 +1226,25 @@ body:not(.has-current) .playerbar {
 .queue-row.active {
   border-color: rgba(36, 240, 120, 0.28);
   background: rgba(36, 240, 120, 0.1);
+}
+
+.queue-play {
+  display: grid;
+  grid-template-columns: 34px 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.queue-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .queue-index {
@@ -1277,6 +1306,9 @@ body:not(.has-current) .playerbar {
   right: 18px;
   bottom: calc(var(--player-height) + 18px);
   z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 12px;
   max-width: min(420px, calc(100vw - 36px));
   padding: 14px 16px;
   border: 1px solid rgba(224, 244, 233, 0.16);
@@ -1287,6 +1319,52 @@ body:not(.has-current) .playerbar {
   color: var(--text);
   box-shadow: 0 18px 52px rgba(0, 0, 0, 0.42);
   backdrop-filter: blur(16px);
+}
+
+.toast-action {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(36, 240, 120, 0.28);
+  border-radius: 999px;
+  background: rgba(36, 240, 120, 0.12);
+  color: var(--green);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.toast-action:hover {
+  background: rgba(36, 240, 120, 0.2);
+}
+
+.scroll-jumps {
+  position: fixed;
+  right: 18px;
+  bottom: calc(var(--player-height) + 78px);
+  z-index: 35;
+  display: grid;
+  gap: 8px;
+}
+
+.scroll-jump {
+  display: inline-grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border: 1px solid rgba(224, 244, 233, 0.16);
+  border-radius: 50%;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent),
+    var(--surface-glass);
+  color: var(--text);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  backdrop-filter: blur(16px);
+}
+
+.scroll-jump:hover {
+  border-color: rgba(36, 240, 120, 0.34);
+  color: var(--green);
 }
 
 .badge-row {
@@ -1608,8 +1686,16 @@ svg {
   }
 
   .queue-row {
-    grid-template-columns: 28px 58px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 9px;
+  }
+
+  .queue-play {
+    grid-template-columns: 28px 58px minmax(0, 1fr);
+  }
+
+  .queue-actions {
+    justify-content: flex-end;
   }
 
   .queue-thumb {
@@ -1743,10 +1829,26 @@ svg {
   }
 
   .toast {
+    align-items: flex-start;
+    flex-direction: column;
     right: 12px;
     bottom: calc(var(--player-height) + var(--mobile-nav-height) + env(safe-area-inset-bottom) + 12px);
     left: 12px;
     max-width: none;
+  }
+
+  .toast-action {
+    align-self: flex-start;
+  }
+
+  .scroll-jumps {
+    right: 12px;
+    bottom: calc(var(--player-height) + var(--mobile-nav-height) + env(safe-area-inset-bottom) + 76px);
+  }
+
+  .scroll-jump {
+    width: 40px;
+    height: 40px;
   }
 }
 

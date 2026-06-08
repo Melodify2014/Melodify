@@ -163,6 +163,8 @@ const icons = {
   refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4L3 16"/><path d="M3 21v-5h5"/><path d="M3 12A9 9 0 0 1 18.4 5.6L21 8"/><path d="M21 3v5h-5"/></svg>',
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 6-12 12"/><path d="m6 6 12 12"/></svg>',
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  "arrow-up": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>',
+  "arrow-down": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>',
   check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20 6-11 11-5-5"/></svg>',
   alert: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>'
 };
@@ -332,6 +334,7 @@ let fastViewCache = {
   renderedChannels: []
 };
 let toastTimer = 0;
+let lastRemovedVideoSnapshot = null;
 let appVersionSignature = "";
 let appServerVersionSignature = "";
 let appUpdateInProgress = false;
@@ -420,6 +423,8 @@ function cacheElements() {
   els.playerSubscribe = document.getElementById("playerSubscribe");
   els.youtubeLink = document.getElementById("youtubeLink");
   els.emptyPlayer = document.getElementById("emptyPlayer");
+  els.scrollTopButton = document.getElementById("scrollTopButton");
+  els.scrollBottomButton = document.getElementById("scrollBottomButton");
 }
 
 async function hydrateState() {
@@ -733,6 +738,9 @@ function bindEvents() {
     render();
     showToast("Back online.");
   });
+
+  window.addEventListener("scroll", updateScrollJumpButtons, { passive: true });
+  window.addEventListener("resize", updateScrollJumpButtons);
 }
 
 async function submitSearchInput() {
@@ -832,6 +840,21 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "queue-move-up") {
+    moveQueueVideo(target.dataset.videoId, -1);
+    return;
+  }
+
+  if (action === "queue-move-down") {
+    moveQueueVideo(target.dataset.videoId, 1);
+    return;
+  }
+
+  if (action === "queue-remove-video") {
+    removeVideoFromQueue(target.dataset.videoId);
+    return;
+  }
+
   if (action === "play-visible") {
     await playVisibleVideos(false);
     return;
@@ -850,6 +873,12 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "add-to-queue") {
+    const video = findVideo(target.dataset.videoId);
+    if (video) addVideoToQueue(video);
+    return;
+  }
+
   if (action === "like") {
     const video = findVideo(target.dataset.videoId);
     if (video) toggleLike(video);
@@ -858,6 +887,11 @@ async function handleAction(action, target, event) {
 
   if (action === "remove-video") {
     await removeVideoFromCache(target.dataset.videoId);
+    return;
+  }
+
+  if (action === "undo-remove-video") {
+    undoRemoveVideo(target.dataset.videoId);
     return;
   }
 
@@ -907,6 +941,16 @@ async function handleAction(action, target, event) {
 
   if (action === "connect-spotify") {
     await connectSpotify();
+    return;
+  }
+
+  if (action === "scroll-top") {
+    scrollPageTo("top");
+    return;
+  }
+
+  if (action === "scroll-bottom") {
+    scrollPageTo("bottom");
     return;
   }
 
@@ -1370,6 +1414,7 @@ function render() {
   renderNav();
   renderPlayer();
   renderView();
+  updateScrollJumpButtons();
 }
 
 function updateConnectionState() {
@@ -1844,6 +1889,9 @@ function renderVideoCard(video) {
       <div class="card-actions">
         <button class="mini-action ${liked ? "active" : ""}" type="button" data-action="like" data-video-id="${escapeAttr(video.id)}" aria-label="${liked ? "Unlike" : "Like"} ${escapeAttr(video.title)}" title="${liked ? "Unlike" : "Like"}">
           ${icon("heart")}
+        </button>
+        <button class="mini-action" type="button" data-action="add-to-queue" data-video-id="${escapeAttr(video.id)}" aria-label="Add ${escapeAttr(video.title)} to Up Next" title="Add to Up Next">
+          ${icon("plus")}
         </button>
         <button class="mini-action ${isFollowing(channel.id) ? "active" : ""}" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}" aria-label="Subscribe to ${escapeAttr(channel.title)}" title="Subscribe">
           ${icon(isFollowing(channel.id) ? "check" : "user-plus")}
@@ -4957,6 +5005,29 @@ async function playVisibleVideos(shuffle) {
   showToast(shuffle && queue.length > 1 ? "Shuffling this list." : "Playing this list.");
 }
 
+function addVideoToQueue(video) {
+  if (!video?.id || !isPlayableVideo(video)) return;
+  if (state.currentVideo?.id === video.id) {
+    showToast("That video is already playing.");
+    return;
+  }
+  const existingIndex = state.queue.findIndex((item) => item?.id === video.id);
+  if (existingIndex >= 0) {
+    showToast("That video is already in Up Next.");
+    return;
+  }
+  const currentId = state.currentVideo?.id || "";
+  const queue = uniqueVideos(state.queue.length ? state.queue : currentId ? [state.currentVideo] : []);
+  const currentIndex = queue.findIndex((item) => item?.id === currentId);
+  const insertAt = currentIndex >= 0 ? currentIndex + 1 : queue.length;
+  queue.splice(insertAt, 0, video);
+  state.queue = queue;
+  state.queueIndex = currentId ? queue.findIndex((item) => item.id === currentId) : -1;
+  persist();
+  renderPlayer();
+  showToast(`Added ${video.title || "video"} to Up Next.`);
+}
+
 function playableListVideos(videos) {
   const allowChannelUploads = state.route === "channel" && state.channelFilter !== "music";
   return uniqueVideos(videos || []).filter((video) => (
@@ -5173,6 +5244,7 @@ async function removeVideoFromCache(videoId) {
   if (!videoId) return;
   const video = findVideo(videoId) || state.videoCache[videoId] || state.likedVideos[videoId] || videoFromRecordingMetadata(videoId);
   const title = video?.title || "Video";
+  lastRemovedVideoSnapshot = snapshotRemovedVideo(videoId, video);
   rememberRemovedVideo(video || { id: videoId });
 
   delete state.videoCache[videoId];
@@ -5225,7 +5297,95 @@ async function removeVideoFromCache(videoId) {
   bumpDataRevision();
   persist();
   render();
-  showToast(`Removed ${title} from cache.`);
+  showToast(`Removed ${title} from cache.`, {
+    label: "Undo",
+    action: "undo-remove-video",
+    videoId
+  });
+}
+
+function snapshotRemovedVideo(videoId, video) {
+  if (!videoId || !video) return null;
+  return {
+    video: cloneData(compactVideo(video)),
+    likedVideo: state.likedVideos[videoId] ? cloneData(state.likedVideos[videoId]) : null,
+    watchedVideo: state.watchedVideos[videoId] ? cloneData(state.watchedVideos[videoId]) : null,
+    unavailableVideo: state.unavailableVideos[videoId] ? cloneData(state.unavailableVideos[videoId]) : null,
+    channelIds: Object.fromEntries(
+      Object.entries(state.channelVideoIds || {})
+        .filter(([, ids]) => (ids || []).includes(videoId))
+        .map(([channelId, ids]) => [channelId, [...ids]])
+    ),
+    channelCaches: Object.fromEntries(
+      Object.entries(state.channelCache || {})
+        .filter(([, cache]) => (cache?.videos || []).some((item) => item?.id === videoId))
+        .map(([channelId, cache]) => [channelId, {
+          channel: cache.channel ? cloneData(cache.channel) : null,
+          videos: cloneData(cache.videos || []),
+          nextPageToken: cache.nextPageToken || "",
+          loading: false
+        }])
+    ),
+    searchResultIndex: (state.searchResults.videos || []).findIndex((item) => item?.id === videoId),
+    searchCacheEntries: Object.fromEntries(
+      Object.entries(state.searchCache || {})
+        .filter(([, entry]) => (entry.videoIds || []).includes(videoId))
+        .map(([key, entry]) => [key, cloneData(entry)])
+    ),
+    queue: cloneData(state.queue || []),
+    queueIndex: state.queueIndex,
+    currentVideo: state.currentVideo?.id === videoId ? cloneData(state.currentVideo) : null
+  };
+}
+
+function undoRemoveVideo(videoId) {
+  if (!videoId || lastRemovedVideoSnapshot?.video?.id !== videoId) return;
+  const snapshot = lastRemovedVideoSnapshot;
+  delete state.removedVideoIds[videoId];
+
+  const video = snapshot.video;
+  if (video) {
+    cacheVideo(video, "channel", false);
+    cacheChannel(channelFromVideo(video), "undo", false);
+  }
+  if (snapshot.likedVideo) state.likedVideos[videoId] = snapshot.likedVideo;
+  if (snapshot.watchedVideo) state.watchedVideos[videoId] = snapshot.watchedVideo;
+  if (snapshot.unavailableVideo) state.unavailableVideos[videoId] = snapshot.unavailableVideo;
+
+  for (const [channelId, ids] of Object.entries(snapshot.channelIds || {})) {
+    state.channelVideoIds[channelId] = uniqueStrings([...(state.channelVideoIds[channelId] || []), ...ids]);
+  }
+  for (const [channelId, cache] of Object.entries(snapshot.channelCaches || {})) {
+    const existing = state.channelCache[channelId] || {};
+    state.channelCache[channelId] = {
+      ...existing,
+      ...cache,
+      videos: uniqueVideos([...(cache.videos || []), ...(existing.videos || [])]),
+      loading: false
+    };
+  }
+
+  if (snapshot.searchResultIndex >= 0 && video) {
+    const videos = (state.searchResults.videos || []).filter((item) => item?.id !== videoId);
+    videos.splice(Math.min(snapshot.searchResultIndex, videos.length), 0, video);
+    state.searchResults = { ...state.searchResults, videos };
+  }
+  for (const [key, entry] of Object.entries(snapshot.searchCacheEntries || {})) state.searchCache[key] = entry;
+  if (snapshot.queue?.length) {
+    state.queue = snapshot.queue.filter((item) => item?.id && !isRemovedVideoId(item.id));
+    state.queueIndex = Math.min(Math.max(0, snapshot.queueIndex), Math.max(0, state.queue.length - 1));
+  }
+  if (snapshot.currentVideo) state.currentVideo = snapshot.currentVideo;
+
+  lastRemovedVideoSnapshot = null;
+  bumpDataRevision();
+  persist();
+  render();
+  showToast(`Restored ${video?.title || "video"}.`);
+}
+
+function cloneData(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function isFollowing(channelId) {
@@ -5592,7 +5752,7 @@ function openQueueModal() {
   const queue = orderedQueueVideos();
   const currentId = state.currentVideo?.id || "";
   const rows = queue.length
-    ? queue.map((video, index) => renderQueueRow(video, index, video.id === currentId)).join("")
+    ? queue.map((video, index) => renderQueueRow(video, index, video.id === currentId, queue.length)).join("")
     : `<p class="empty-copy">Play a music video and Melodify will build an Up Next queue from the current list.</p>`;
   els.modalRoot.innerHTML = `
     <section class="modal queue-modal" role="dialog" aria-modal="true" aria-label="Up Next">
@@ -5622,17 +5782,67 @@ function orderedQueueVideos() {
   return [queue[currentIndex], ...queue.slice(currentIndex + 1), ...queue.slice(0, currentIndex)];
 }
 
-function renderQueueRow(video, index, current) {
+function renderQueueRow(video, index, current, total) {
+  const firstEditable = state.currentVideo ? index <= 1 : index === 0;
+  const lastItem = index >= total - 1;
   return `
-    <button class="queue-row ${current ? "active" : ""}" type="button" data-action="play-queue-video" data-video-id="${escapeAttr(video.id)}">
-      <span class="queue-index">${current ? icon("play") : index + 1}</span>
-      <span class="queue-thumb" style="background-image: url('${escapeAttr(video.thumbnail || "")}')"></span>
-      <span class="queue-copy">
-        <strong>${escapeHtml(video.title || "Untitled")}</strong>
-        <span>${escapeHtml(video.channelTitle || "Music video")}</span>
-      </span>
-    </button>
+    <article class="queue-row ${current ? "active" : ""}">
+      <button class="queue-play" type="button" data-action="play-queue-video" data-video-id="${escapeAttr(video.id)}" aria-label="Play ${escapeAttr(video.title || "queued video")}">
+        <span class="queue-index">${current ? icon("play") : index + 1}</span>
+        <span class="queue-thumb" style="background-image: url('${escapeAttr(video.thumbnail || "")}')"></span>
+        <span class="queue-copy">
+          <strong>${escapeHtml(video.title || "Untitled")}</strong>
+          <span>${escapeHtml(current ? "Now playing" : video.channelTitle || "Music video")}</span>
+        </span>
+      </button>
+      <div class="queue-actions" aria-label="Queue edit controls">
+        <button class="mini-action" type="button" data-action="queue-move-up" data-video-id="${escapeAttr(video.id)}" aria-label="Move ${escapeAttr(video.title || "video")} up" title="Move up" ${current || firstEditable ? "disabled" : ""}>
+          ${icon("arrow-up")}
+        </button>
+        <button class="mini-action" type="button" data-action="queue-move-down" data-video-id="${escapeAttr(video.id)}" aria-label="Move ${escapeAttr(video.title || "video")} down" title="Move down" ${current || lastItem ? "disabled" : ""}>
+          ${icon("arrow-down")}
+        </button>
+        <button class="mini-action danger-action" type="button" data-action="queue-remove-video" data-video-id="${escapeAttr(video.id)}" aria-label="Remove ${escapeAttr(video.title || "video")} from queue" title="Remove from queue" ${current ? "disabled" : ""}>
+          ${icon("close")}
+        </button>
+      </div>
+    </article>
   `;
+}
+
+function normalizeQueueToVisibleOrder() {
+  state.queue = orderedQueueVideos();
+  state.queueIndex = Math.max(0, state.queue.findIndex((video) => video.id === state.currentVideo?.id));
+  if (!state.queue.length) state.queueIndex = -1;
+}
+
+function moveQueueVideo(videoId, direction) {
+  if (!videoId) return;
+  normalizeQueueToVisibleOrder();
+  const currentId = state.currentVideo?.id || "";
+  const index = state.queue.findIndex((video) => video.id === videoId);
+  if (index < 0 || videoId === currentId) return;
+  const minIndex = currentId ? 1 : 0;
+  const targetIndex = index + direction;
+  if (targetIndex < minIndex || targetIndex >= state.queue.length) return;
+  [state.queue[index], state.queue[targetIndex]] = [state.queue[targetIndex], state.queue[index]];
+  state.queueIndex = Math.max(0, state.queue.findIndex((video) => video.id === currentId));
+  persist();
+  openQueueModal();
+  renderPlayer();
+}
+
+function removeVideoFromQueue(videoId) {
+  if (!videoId || videoId === state.currentVideo?.id) return;
+  const before = state.queue.length;
+  state.queue = (state.queue || []).filter((video) => video?.id !== videoId);
+  state.queueIndex = Math.max(0, state.queue.findIndex((video) => video.id === state.currentVideo?.id));
+  if (!state.queue.length) state.queueIndex = -1;
+  if (state.queue.length === before) return;
+  persist();
+  openQueueModal();
+  renderPlayer();
+  showToast("Removed from Up Next.");
 }
 
 function clearQueue() {
@@ -5709,13 +5919,39 @@ function focusSearch() {
   els.searchInput.select();
 }
 
-function showToast(message) {
+function showToast(message, action = null) {
   clearTimeout(toastTimer);
-  els.toast.textContent = message;
+  if (action?.label && action?.action) {
+    els.toast.innerHTML = `
+      <span>${escapeHtml(message)}</span>
+      <button class="toast-action" type="button" data-action="${escapeAttr(action.action)}" ${action.videoId ? `data-video-id="${escapeAttr(action.videoId)}"` : ""}>
+        ${escapeHtml(action.label)}
+      </button>
+    `;
+  } else {
+    els.toast.textContent = message;
+  }
   els.toast.hidden = false;
   toastTimer = window.setTimeout(() => {
     els.toast.hidden = true;
   }, 4200);
+}
+
+function updateScrollJumpButtons() {
+  if (!els.scrollTopButton || !els.scrollBottomButton) return;
+  const scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
+  const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+  const longPage = maxScroll > 420;
+  els.scrollTopButton.hidden = !longPage || scrollTop < 280;
+  els.scrollBottomButton.hidden = !longPage || maxScroll - scrollTop < 420;
+}
+
+function scrollPageTo(position) {
+  const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+  window.scrollTo({
+    top: position === "bottom" ? maxScroll : 0,
+    behavior: "smooth"
+  });
 }
 
 function installIcons(root) {
