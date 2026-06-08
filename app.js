@@ -152,6 +152,7 @@ const icons = {
   previous: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 20 9 12l10-8v16Z"/><path d="M5 19V5"/></svg>',
   next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 4 10 8-10 8V4Z"/><path d="M19 5v14"/></svg>',
   loop: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="m7 22-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',
+  shuffle: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 18h2.6a5 5 0 0 0 3.8-1.8L15.6 7A5 5 0 0 1 19.4 5H22"/><path d="m18 2 4 3-4 3"/><path d="M2 6h2.6a5 5 0 0 1 3.8 1.8l1.3 1.7"/><path d="m18 16 4 3-4 3"/><path d="M22 19h-2.6a5 5 0 0 1-3.8-1.8l-1.4-1.8"/></svg>',
   "user-plus": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/></svg>',
   external: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="m10 14 11-11"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
   music: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
@@ -401,6 +402,7 @@ function cacheElements() {
   els.playerRecording = document.getElementById("playerRecording");
   els.playerRecordingIcon = document.getElementById("playerRecordingIcon");
   els.queueButton = document.getElementById("queueButton");
+  els.playerCopy = document.getElementById("playerCopy");
   els.playerLike = document.getElementById("playerLike");
   els.playerSubscribe = document.getElementById("playerSubscribe");
   els.youtubeLink = document.getElementById("youtubeLink");
@@ -792,6 +794,16 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "play-visible") {
+    await playVisibleVideos(false);
+    return;
+  }
+
+  if (action === "shuffle-visible") {
+    await playVisibleVideos(true);
+    return;
+  }
+
   if (action === "play") {
     const video = findVideo(target.dataset.videoId);
     if (video) {
@@ -879,6 +891,11 @@ async function handleAction(action, target, event) {
 
   if (action === "current-recording" && state.currentVideo) {
     await attachRecording(state.currentVideo);
+    return;
+  }
+
+  if (action === "current-copy") {
+    await copyCurrentVideoLink();
     return;
   }
 
@@ -1366,6 +1383,7 @@ function renderHomeView() {
         <h1 class="view-title">Melodify</h1>
       </div>
       <div class="view-actions">
+        ${renderListQuickActions(picks)}
         <div class="badge-row">
           <span class="badge green">${likedCount} liked</span>
           <span class="badge amber">${followedCount} following</span>
@@ -1480,6 +1498,9 @@ function renderSearchView() {
         <p class="eyebrow">Web + cache</p>
         <h1 class="view-title">${title}</h1>
       </div>
+      <div class="view-actions">
+        ${renderListQuickActions(videos)}
+      </div>
     </header>
     ${channelSection}
     ${videoSection}
@@ -1495,6 +1516,9 @@ function renderLikedView() {
       <div>
         <p class="eyebrow">${videos.length} saved</p>
         <h1 class="view-title">Liked videos</h1>
+      </div>
+      <div class="view-actions">
+        ${renderListQuickActions(videos)}
       </div>
     </header>
     ${renderVideoGrid(videos, { key: "liked" })}
@@ -1512,6 +1536,9 @@ function renderRecordedView() {
       <div>
         <p class="eyebrow">${videos.length} offline recordings</p>
         <h1 class="view-title">Recorded</h1>
+      </div>
+      <div class="view-actions">
+        ${renderListQuickActions(videos)}
       </div>
     </header>
     ${renderVideoGrid(videos, { key: "recorded" })}
@@ -1557,10 +1584,13 @@ function renderRecommendedView() {
         <p class="eyebrow">${state.dailyPlaylists.date === todayKey() ? "AI profile recommendations" : "Local profile ranking"}</p>
         <h1 class="view-title">Recommended</h1>
       </div>
-      <button class="secondary-button" type="button" data-action="refresh-recommendations">
-        <span data-icon="sparkles" aria-hidden="true"></span>
-        <span>Refresh</span>
-      </button>
+      <div class="view-actions">
+        ${renderListQuickActions(videos)}
+        <button class="secondary-button" type="button" data-action="refresh-recommendations">
+          <span data-icon="sparkles" aria-hidden="true"></span>
+          <span>Refresh</span>
+        </button>
+      </div>
     </header>
     ${state.loading && !videos.length ? renderSkeletonGrid() : playlistHtml}
     ${state.loading && !channels.length ? "" : channelHtml}
@@ -1605,6 +1635,7 @@ function renderChannelView() {
         </div>
       </div>
       <div class="view-actions">
+        ${renderListQuickActions(videos)}
         <div class="segmented compact" role="group" aria-label="Channel video filter">
           <button type="button" class="segment ${state.channelFilter === "all" ? "active" : ""}" data-action="set-channel-filter" data-filter="all">All</button>
           <button type="button" class="segment ${state.channelFilter === "videos" ? "active" : ""}" data-action="set-channel-filter" data-filter="videos">Videos</button>
@@ -1636,6 +1667,23 @@ function renderChannelEmptyState(channelId, totalVideos, canDiscoverMore, loadin
     </div>
   ` : "";
   return `${renderEmpty("No music videos loaded", message, "music")}${action}`;
+}
+
+function renderListQuickActions(videos) {
+  const count = playableListVideos(videos).length;
+  if (!count) return "";
+  return `
+    <div class="list-quick-actions" aria-label="List playback">
+      <button class="secondary-button compact-action" type="button" data-action="play-visible" title="Play this list" aria-label="Play this list">
+        <span data-icon="play" aria-hidden="true"></span>
+        <span>Play</span>
+      </button>
+      <button class="secondary-button compact-action" type="button" data-action="shuffle-visible" title="Shuffle this list" aria-label="Shuffle this list">
+        <span data-icon="shuffle" aria-hidden="true"></span>
+        <span>Shuffle</span>
+      </button>
+    </div>
+  `;
 }
 
 function renderDailyPlaylist(playlist) {
@@ -1835,12 +1883,13 @@ function renderPlayer() {
   els.playerRecording.disabled = !hasVideo || spotify;
   els.playerRecording.classList.toggle("active", hasLocalRecording);
   if (els.queueButton) els.queueButton.disabled = !hasVideo && !state.queue.length;
+  if (els.playerCopy) els.playerCopy.disabled = !hasVideo;
   els.playerRecording.title = hasLocalRecording ? "Replace offline recording" : "Add offline recording";
   els.playerRecording.setAttribute("aria-label", hasVideo ? `${hasLocalRecording ? "Replace" : "Add"} offline recording for ${video.title}` : "Add offline recording");
   els.playerRecordingIcon.innerHTML = icon(hasLocalRecording ? "check" : "plus");
   els.playerLike.disabled = !hasVideo;
   els.playerSubscribe.disabled = !hasVideo || spotify;
-  els.youtubeLink.href = hasVideo ? spotify ? video.spotifyUrl || "https://open.spotify.com" : `https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}` : "https://www.youtube.com";
+  els.youtubeLink.href = hasVideo ? videoExternalUrl(video) : "https://www.youtube.com";
   els.youtubeLink.title = hasVideo && spotify ? "Open on Spotify" : "Open on YouTube";
   els.youtubeLink.setAttribute("aria-label", hasVideo && spotify ? "Open on Spotify" : "Open on YouTube");
 
@@ -2024,6 +2073,21 @@ async function copyChannelLink(channelId) {
   const url = `${base}#channel/${encodeURIComponent(channelId)}`;
   await copyText(url);
   showToast("Channel link copied.");
+}
+
+async function copyCurrentVideoLink() {
+  if (!state.currentVideo) {
+    showToast("Play a video first.");
+    return;
+  }
+  await copyText(videoExternalUrl(state.currentVideo));
+  showToast("Video link copied.");
+}
+
+function videoExternalUrl(video) {
+  if (!video) return "https://www.youtube.com";
+  if (isSpotifyVideo(video)) return video.spotifyUrl || "https://open.spotify.com";
+  return video.watchUrl || `https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}`;
 }
 
 async function copyText(text) {
@@ -4622,6 +4686,29 @@ function playAdjacent(direction, options = {}) {
     return true;
   }
   return false;
+}
+
+async function playVisibleVideos(shuffle) {
+  const queue = shuffle ? shuffleVideos(playableListVideos(lastVisibleVideos)) : playableListVideos(lastVisibleVideos);
+  if (!queue.length) {
+    showToast("No playable music videos here yet.");
+    return;
+  }
+  await playVideo(queue[0], queue);
+  showToast(shuffle && queue.length > 1 ? "Shuffling this list." : "Playing this list.");
+}
+
+function playableListVideos(videos) {
+  return uniqueVideos(videos || []).filter((video) => isPlayableVideo(video) && (hasRecording(video.id) || isLikelyMusicVideo(video)));
+}
+
+function shuffleVideos(videos) {
+  const copy = [...videos];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+  }
+  return copy;
 }
 
 function fallbackPlaybackQueue() {

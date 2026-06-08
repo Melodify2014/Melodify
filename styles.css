@@ -355,6 +355,14 @@ body:not(.is-offline) [data-nav="recorded"] {
   justify-content: flex-end;
 }
 
+.list-quick-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .view-title {
   margin: 0;
   font-size: clamp(1.7rem, 3vw, 3rem);
