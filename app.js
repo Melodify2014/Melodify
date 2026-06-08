@@ -286,6 +286,7 @@ const state = {
   recentSearches: [],
   channelVisibleCounts: {},
   recordings: {},
+  removedVideoIds: {},
   dailyPlaylists: { date: "", playlists: [] },
   channelOwnershipModelVersion: CHANNEL_OWNERSHIP_MODEL_VERSION,
   unavailableVideos: {},
@@ -319,6 +320,17 @@ let spotifyPlayerConnecting = false;
 let fileModeToastShown = false;
 let lastVisibleVideos = [];
 let metadataMatrix = null;
+let dataRevision = 0;
+let fastViewCache = {
+  localRecommendationsRevision: -1,
+  localRecommendations: [],
+  renderedPlaylistsRevision: -1,
+  renderedPlaylistsKey: "",
+  renderedPlaylists: [],
+  renderedChannelsRevision: -1,
+  renderedChannelsKey: "",
+  renderedChannels: []
+};
 let toastTimer = 0;
 let appVersionSignature = "";
 let appServerVersionSignature = "";
@@ -327,6 +339,7 @@ let followedChannelRefreshInFlight = false;
 let channelBackgroundDiscoveryInFlight = false;
 let activeSearchRequestId = 0;
 let scheduledPersistTimer = 0;
+let recommendationsLoadInFlight = false;
 const channelAutoLoadRequests = new Map();
 const gridVisibleCounts = new Map();
 
@@ -358,6 +371,7 @@ async function init() {
   await handleSpotifyAuthCallback();
   await hydrateSpotify();
   primeCache();
+  pruneRemovedVideosFromState(true);
   pruneNonMusicCache();
   installIcons(document);
   bindEvents();
@@ -445,6 +459,7 @@ function applySavedState(saved = {}) {
   state.recentSearches = Array.isArray(saved.recentSearches) ? saved.recentSearches.slice(0, RECENT_SEARCH_LIMIT) : [];
   state.channelVisibleCounts = saved.channelVisibleCounts || {};
   state.recordings = saved.recordings || {};
+  state.removedVideoIds = saved.removedVideoIds || {};
   state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
   state.channelOwnershipModelVersion = saved.channelOwnershipModelVersion || 1;
   state.recommendedChannels = saved.recommendedChannels || [];
@@ -483,6 +498,7 @@ function stateSnapshot() {
     recentSearches: state.recentSearches,
     channelVisibleCounts: state.channelVisibleCounts,
     recordings: state.recordings,
+    removedVideoIds: state.removedVideoIds,
     dailyPlaylists: state.dailyPlaylists,
     channelOwnershipModelVersion: CHANNEL_OWNERSHIP_MODEL_VERSION,
     recommendedChannels: state.recommendedChannels,
@@ -504,6 +520,7 @@ function localStateSnapshot(snapshot) {
     recentSearches: snapshot.recentSearches,
     channelVisibleCounts: snapshot.channelVisibleCounts,
     recordings: snapshot.recordings,
+    removedVideoIds: snapshot.removedVideoIds,
     unavailableVideos: snapshot.unavailableVideos,
     channelOwnershipModelVersion: snapshot.channelOwnershipModelVersion,
     availabilityModelVersion: snapshot.availabilityModelVersion,
@@ -1350,7 +1367,6 @@ function routeFromHash() {
 
 function render() {
   updateConnectionState();
-  installIcons(document);
   renderNav();
   renderPlayer();
   renderView();
@@ -1593,9 +1609,9 @@ function renderFollowingView() {
 }
 
 function renderRecommendedView() {
-  const playlists = getRenderedDailyPlaylists();
+  const playlists = state.loading && !(state.dailyPlaylists.playlists || []).length ? [] : getRenderedDailyPlaylists();
   const videos = playlists.flatMap((playlist) => playlist.videos);
-  const channels = getRenderedRecommendedChannels();
+  const channels = state.loading && !videos.length ? [] : getRenderedRecommendedChannels();
   lastVisibleVideos = videos;
   const playlistHtml = playlists.length
     ? playlists.map(renderDailyPlaylist).join("")
@@ -1628,7 +1644,7 @@ function renderChannelView() {
     ? `<img class="channel-hero-avatar" src="${escapeAttr(channel.thumbnail)}" alt="" loading="lazy">`
     : `<span class="channel-hero-avatar placeholder">${escapeHtml(initials(channel.title))}</span>`;
   const storedIds = state.channelVideoIds[state.activeChannelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => trustedChannelVideo(video, channel));
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => !isRemovedVideoId(video.id) && trustedChannelVideo(video, channel));
   const cache = state.channelCache[state.activeChannelId] || (storedVideos.length ? { channel, videos: storedVideos, nextPageToken: "", loading: false } : null);
   const allVideos = uniqueVideos([...(cache?.videos || []), ...storedVideos]).filter((video) => trustedChannelVideo(video, channel));
   const videos = sortChannelVideos(applyChannelFilter(allVideos));
@@ -1950,12 +1966,19 @@ async function maybeLoadRouteData() {
     loadChannelVideos(state.activeChannelId, true).catch(() => {});
   }
 
-  if (state.route === "recommended" && !state.loading && !state.dailyPlaylists.playlists.length) {
-    await loadRecommendations(false);
+  if (state.route === "recommended" && !state.loading && !recommendationsLoadInFlight && !state.dailyPlaylists.playlists.length) {
+    recommendationsLoadInFlight = true;
+    window.setTimeout(() => {
+      loadRecommendations(false).finally(() => {
+        recommendationsLoadInFlight = false;
+      });
+    }, 0);
   }
 
-  if (state.route === "following" || state.route === "recommended") {
-    refreshFollowedChannelsCache(false);
+  if ((state.route === "following" || state.route === "recommended") && !followedChannelRefreshInFlight) {
+    window.setTimeout(() => {
+      if (state.route === "following" || state.route === "recommended") refreshFollowedChannelsCache(false);
+    }, 0);
   }
 }
 
@@ -2151,7 +2174,7 @@ async function runSearch(query, filter, options = {}) {
 
   const importedFromInput = await importDirectSearchInput(query);
   if (!isActiveSearchRequest(requestId)) return;
-  if (importedFromInput) {
+  if (importedFromInput && !isRemovedVideoId(importedFromInput.id)) {
     const channel = channelFromVideo(importedFromInput);
     state.searchResults = {
       videos: filter === "channels" ? [] : [importedFromInput],
@@ -2260,8 +2283,111 @@ function yieldToBrowser() {
   });
 }
 
+function bumpDataRevision() {
+  dataRevision += 1;
+  metadataMatrix = null;
+}
+
+function isRemovedVideoId(videoId) {
+  return Boolean(videoId && state.removedVideoIds?.[videoId]);
+}
+
+function rememberRemovedVideo(video) {
+  if (!video?.id) return false;
+  const existing = state.removedVideoIds[video.id];
+  state.removedVideoIds[video.id] = {
+    id: video.id,
+    title: video.title || existing?.title || "",
+    channelId: video.channelId || existing?.channelId || "",
+    channelTitle: video.channelTitle || existing?.channelTitle || "",
+    removedAt: new Date().toISOString()
+  };
+  bumpDataRevision();
+  return true;
+}
+
+function filterRemovedVideos(videos) {
+  return (videos || []).filter((video) => video?.id && !isRemovedVideoId(video.id));
+}
+
+function filterRemovedVideoIds(ids) {
+  return (ids || []).filter((id) => id && !isRemovedVideoId(id));
+}
+
+function pruneRemovedVideosFromState(shouldPersist = false) {
+  let changed = false;
+  const removeFromMap = (map) => {
+    for (const id of Object.keys(map || {})) {
+      if (!isRemovedVideoId(id)) continue;
+      delete map[id];
+      changed = true;
+    }
+  };
+  const filterList = (list) => {
+    const filtered = filterRemovedVideos(list);
+    if (filtered.length !== (list || []).length) changed = true;
+    return filtered;
+  };
+
+  removeFromMap(state.videoCache);
+  removeFromMap(state.likedVideos);
+  removeFromMap(state.watchedVideos);
+  removeFromMap(state.unavailableVideos);
+  removeFromMap(state.sessionBlockedVideos);
+  removeFromMap(state.recordings);
+
+  state.searchResults = { ...state.searchResults, videos: filterList(state.searchResults.videos) };
+  state.recommendations = filterList(state.recommendations);
+  state.queue = filterList(state.queue);
+  if (state.queue.length) {
+    state.queueIndex = Math.max(0, state.queue.findIndex((video) => video.id === state.currentVideo?.id));
+  } else {
+    state.queueIndex = -1;
+  }
+
+  for (const [channelId, ids] of Object.entries(state.channelVideoIds || {})) {
+    const filtered = filterRemovedVideoIds(ids);
+    if (filtered.length !== (ids || []).length) changed = true;
+    if (filtered.length) state.channelVideoIds[channelId] = filtered;
+    else delete state.channelVideoIds[channelId];
+  }
+
+  for (const cache of Object.values(state.channelCache || {})) {
+    if (!cache?.videos) continue;
+    cache.videos = filterList(cache.videos);
+  }
+
+  for (const [key, entry] of Object.entries(state.searchCache || {})) {
+    const filtered = filterRemovedVideoIds(entry.videoIds || []);
+    if (filtered.length !== (entry.videoIds || []).length) changed = true;
+    if (!filtered.length && !(entry.channelIds || []).length) delete state.searchCache[key];
+    else entry.videoIds = filtered;
+  }
+
+  const playlists = (state.dailyPlaylists.playlists || []).map((playlist) => {
+    const videoIds = filterRemovedVideoIds(playlist.videoIds || []);
+    if (videoIds.length !== (playlist.videoIds || []).length) changed = true;
+    return { ...playlist, videoIds };
+  }).filter((playlist) => playlist.videoIds.length);
+  if (playlists.length !== (state.dailyPlaylists.playlists || []).length) changed = true;
+  state.dailyPlaylists = { ...state.dailyPlaylists, playlists };
+
+  if (state.currentVideo && isRemovedVideoId(state.currentVideo.id)) {
+    state.currentVideo = null;
+    state.isPlaying = false;
+    state.queue = [];
+    state.queueIndex = -1;
+    playerBlocked = false;
+    changed = true;
+  }
+
+  if (changed) bumpDataRevision();
+  if (changed && shouldPersist) persist();
+  return changed;
+}
+
 function mergeSearchResults(a, b) {
-  const videos = rankSearchVideos([...(a?.videos || []), ...(b?.videos || [])], state.query);
+  const videos = rankSearchVideos([...(a?.videos || []), ...(b?.videos || [])].filter((video) => !isRemovedVideoId(video?.id)), state.query);
   const channels = filterChannelsForQuery([...(a?.channels || []), ...(b?.channels || []), ...deriveChannelsFromVideos(videos, state.query)], state.query, videos);
   return { videos, channels };
 }
@@ -2478,6 +2604,7 @@ async function importVideosFromUrls(urls, options = {}) {
     const batch = candidates.slice(index, index + VIDEO_IMPORT_CONCURRENCY);
     const results = await Promise.all(batch.map((url) => importVideoFromUrl(url, { quiet: true, updateView: false, requireMusic, query, deferPersist: true })));
     for (const video of results) {
+      if (isRemovedVideoId(video?.id)) continue;
       const hintedViews = viewHints instanceof Map ? viewHints.get(video?.id) : 0;
       const hintedChannelId = channelHints instanceof Map ? channelHints.get(video?.id) : "";
       if (video && hintedViews) {
@@ -2913,11 +3040,11 @@ function friendlyDiscoveryError(error) {
 async function loadChannelVideos(channelId, append) {
   const channel = findChannel(channelId) || { id: channelId, title: "Creator", description: "", thumbnail: "" };
   const storedIds = state.channelVideoIds[channelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean);
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => !isRemovedVideoId(video.id));
   const existing = state.channelCache[channelId] || { channel, videos: storedVideos, nextPageToken: "", loading: false };
 
   if (channelId.startsWith("demo-")) {
-    const videos = demoVideos.filter((video) => video.channelId === channelId);
+    const videos = demoVideos.filter((video) => video.channelId === channelId && !isRemovedVideoId(video.id));
     state.channelCache[channelId] = { channel, videos, nextPageToken: "", loading: false };
     cacheChannelVideos(channelId, videos, false, { markFetched: false });
     render();
@@ -2951,7 +3078,7 @@ async function expandChannelDiscovery(channelId, force, options = {}) {
   if (!force && !shouldDiscoverChannel(channelId)) return [];
 
   const storedIds = state.channelVideoIds[channelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean);
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => !isRemovedVideoId(video.id));
   const existing = state.channelCache[channelId] || { channel, videos: storedVideos, nextPageToken: "", loading: false };
   state.channelCache[channelId] = { ...existing, channel, videos: uniqueVideos([...(existing.videos || []), ...storedVideos]), loading: true };
   if (renderUpdates) render();
@@ -3012,6 +3139,7 @@ async function loadRecommendations(force) {
   if (!force && state.dailyPlaylists.date === today && state.dailyPlaylists.playlists.length && getRenderedDailyPlaylists().length) return;
   state.loading = true;
   render();
+  await yieldToBrowser();
 
   const profile = buildRecommendationProfile();
   let discovered = { videos: [], channels: [] };
@@ -3042,10 +3170,9 @@ function buildRecommendationProfile() {
   const followedChannels = Object.values(state.followedChannels);
   const followedVideos = uniqueVideos(followedChannels.flatMap((channel) => channelVideos(channel.id))).filter(isLikelyMusicVideo);
   const likedVideos = Object.values(state.likedVideos).filter(isLikelyMusicVideo);
-  const cachedVideos = Object.values(state.videoCache).filter(isLikelyMusicVideo);
+  const cachedVideos = recentCachedVideos(420).filter(isLikelyMusicVideo);
   const seedVideos = uniqueVideos([...followedVideos, ...likedVideos, ...cachedVideos, ...demoVideos]);
-  const matrix = getMetadataMatrix();
-  const matrixTerms = topMatrixTerms(matrix, 12).filter(isUsefulRecommendationTerm);
+  const matrixTerms = [];
   const weightedTerms = topProfileTerms(seedVideos, 12).filter(isUsefulRecommendationTerm);
   const genres = recommendationGenreTerms(seedVideos, [...matrixTerms, ...weightedTerms]).slice(0, 5);
   const terms = uniqueStrings([...genres, ...matrixTerms, ...weightedTerms]).slice(0, 8);
@@ -3214,26 +3341,42 @@ function oneVideoPerChannel(videos) {
 }
 
 function getRenderedRecommendedChannels() {
+  const channelKey = [
+    (state.recommendedChannels || []).map((channel) => channel.id).join(","),
+    (state.recommendations || []).map((video) => video.id).join(","),
+    (state.dailyPlaylists.playlists || []).map((playlist) => (playlist.videoIds || []).join(",")).join(";")
+  ].join("::");
+  if (
+    fastViewCache.renderedChannelsRevision === dataRevision &&
+    fastViewCache.renderedChannelsKey === channelKey
+  ) {
+    return fastViewCache.renderedChannels;
+  }
   const playlistVideos = getRenderedDailyPlaylists().flatMap((playlist) => playlist.videos);
   const channels = uniqueChannels([
     ...(state.recommendedChannels || []),
     ...deriveChannelsFromVideos([...state.recommendations, ...playlistVideos], "")
   ]);
-  return rankRecommendedChannels(channels, playlistVideos).slice(0, 12);
+  const rendered = rankRecommendedChannels(channels, playlistVideos).slice(0, 12);
+  fastViewCache.renderedChannelsRevision = dataRevision;
+  fastViewCache.renderedChannelsKey = channelKey;
+  fastViewCache.renderedChannels = rendered;
+  return rendered;
 }
 
 function rankRecommendedChannels(channels, videos = []) {
-  const matrix = getMetadataMatrix();
   const videosByChannel = new Map();
   for (const video of videos || []) {
     if (!video?.channelId) continue;
     videosByChannel.set(video.channelId, (videosByChannel.get(video.channelId) || 0) + 1);
   }
+  const profileTerms = fastRecommendationProfileTerms();
   return uniqueChannels(channels)
     .filter((channel) => channel?.id && !isFollowing(channel.id) && !String(channel.id).startsWith("demo-"))
     .map((channel) => {
-      const row = matrix.channelById.get(channel.id);
-      const profileScore = row ? dotVectors(row.vector, matrix.profileVector) * 100 : 0;
+      const tokens = new Set(tokenize(`${channel.title || ""} ${channel.description || ""} ${channel.url || ""}`));
+      let profileScore = 0;
+      for (const token of tokens) if (profileTerms.has(token)) profileScore += 6;
       const videoBoost = Math.min(40, (videosByChannel.get(channel.id) || channelVideos(channel.id).length) * 8);
       const genreBoost = recommendationGenreTerms([], [searchable(channel)]).length ? 12 : 0;
       return { channel, score: profileScore + videoBoost + genreBoost + queryMatchScore(channel, channel.title || "") };
@@ -3243,7 +3386,7 @@ function rankRecommendedChannels(channels, videos = []) {
 }
 
 function rankRecommendationVideos(videos) {
-  return rankVideos(videos).filter(isRecommendationVideo);
+  return rankFastRecommendationVideos(videos);
 }
 
 function rankPopularRecommendationVideos(videos) {
@@ -3306,16 +3449,29 @@ function limitDiscoveryQuery(query) {
 
 function getRenderedDailyPlaylists() {
   const playlists = state.dailyPlaylists.playlists || [];
+  const playlistKey = playlists.map((playlist) => `${playlist.id}:${(playlist.videoIds || []).join(",")}`).join(";");
+  if (
+    fastViewCache.renderedPlaylistsRevision === dataRevision &&
+    fastViewCache.renderedPlaylistsKey === playlistKey
+  ) {
+    return fastViewCache.renderedPlaylists;
+  }
+  let rendered;
   if (playlists.length) {
-    return playlists
+    rendered = playlists
       .map((playlist) => ({
         ...playlist,
         videos: (playlist.videoIds || []).map((id) => state.videoCache[id]).filter(isNewCreatorRecommendationVideo)
       }))
       .filter((playlist) => playlist.videos.length);
+  } else {
+    const videos = getLocalRecommendations();
+    rendered = [{ id: "local-mix", title: "Cached Mix", query: "Saved from your likes and follows", videos }];
   }
-  const videos = getLocalRecommendations();
-  return [{ id: "local-mix", title: "Cached Mix", query: "Saved from your likes and follows", videos }];
+  fastViewCache.renderedPlaylistsRevision = dataRevision;
+  fastViewCache.renderedPlaylistsKey = playlistKey;
+  fastViewCache.renderedPlaylists = rendered;
+  return rendered;
 }
 
 function buildDailyPlaylistQueries() {
@@ -3388,7 +3544,7 @@ async function refreshChannelFeed(channelId, options = {}) {
     feedUrl: feedUrlForChannel(channelId)
   };
   const storedIds = state.channelVideoIds[channelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean);
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => !isRemovedVideoId(video.id));
   const existing = state.channelCache[channelId] || { channel: baseChannel, videos: storedVideos, nextPageToken: "", loading: false };
 
   if (!force && storedVideos.length && !shouldRefreshChannel(channelId)) {
@@ -3647,13 +3803,13 @@ function channelUrlFromVideo(video) {
 function demoSearch(query, filter) {
   const text = query.toLowerCase();
   const videos = filter !== "channels"
-    ? demoVideos.filter((video) => searchable(video).includes(text))
+    ? demoVideos.filter((video) => !isRemovedVideoId(video.id) && searchable(video).includes(text))
     : [];
   const channels = filter !== "videos"
     ? demoChannels.filter((channel) => searchable(channel).includes(text))
     : [];
   return {
-    videos: videos.length ? videos : demoVideos,
+    videos: videos.length ? videos : demoVideos.filter((video) => !isRemovedVideoId(video.id)),
     channels: channels.length ? channels : demoChannels
   };
 }
@@ -3744,7 +3900,7 @@ function getCachedSearchEntry(query, filter) {
   const entry = state.searchCache[searchCacheKey(query, filter)];
   if (!entry) return null;
   if (Date.now() - Number(entry.fetchedAt || 0) > SEARCH_CACHE_TTL_MS) return null;
-  const videos = rankSearchVideos((entry.videoIds || []).map((id) => state.videoCache[id]).filter(Boolean), query);
+  const videos = rankSearchVideos(filterRemovedVideoIds(entry.videoIds || []).map((id) => state.videoCache[id]).filter(Boolean), query);
   const channels = filterChannelsForQuery((entry.channelIds || []).map((id) => state.cachedChannels[id]).filter(Boolean), query, videos);
   if (!videos.length && !channels.length) return null;
   return { videos, channels };
@@ -3754,7 +3910,7 @@ function writeSearchCache(query, filter, results, options = {}) {
   state.searchCache[searchCacheKey(query, filter)] = {
     query,
     filter,
-    videoIds: (results.videos || []).map((video) => video.id).filter(Boolean),
+    videoIds: (results.videos || []).map((video) => video.id).filter((id) => id && !isRemovedVideoId(id)),
     channelIds: (results.channels || []).map((channel) => channel.id).filter(Boolean),
     fetchedAt: Date.now()
   };
@@ -3833,7 +3989,7 @@ function channelVideos(channelId) {
   const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || null;
   return (state.channelVideoIds[channelId] || [])
     .map((id) => state.videoCache[id])
-    .filter((video) => video && (!channel || trustedChannelVideo(video, channel)));
+    .filter((video) => video && !isRemovedVideoId(video.id) && (!channel || trustedChannelVideo(video, channel)));
 }
 
 function normalizeCreatorKey(value) {
@@ -4009,6 +4165,7 @@ function cacheVideos(videos, source = "seen", shouldPersist = true) {
 
 function cacheVideo(video, source = "seen", shouldPersist = true) {
   if (!video?.id) return;
+  if (isRemovedVideoId(video.id)) return;
   if (source !== "demo" && source !== "recording" && !isLikelyMusicVideo(video) && !isChannelCacheSource(source)) return;
   if (video.channelId) cacheChannel(channelFromVideo(video), source, false);
   const existing = state.videoCache[video.id] || {};
@@ -4023,6 +4180,7 @@ function cacheVideo(video, source = "seen", shouldPersist = true) {
     firstSeenAt: existing.firstSeenAt || new Date().toISOString(),
     lastSeenAt: new Date().toISOString()
   };
+  bumpDataRevision();
   if (shouldPersist) persist();
 }
 
@@ -4082,6 +4240,7 @@ function cacheChannel(channel, source = "seen", shouldPersist = true) {
     lastSeenAt: new Date().toISOString()
   };
   rememberCreatorQuery(channel.title, state.cachedChannels[channel.id]);
+  bumpDataRevision();
   if (shouldPersist) persist();
 }
 
@@ -4089,14 +4248,15 @@ function cacheChannelVideos(channelId, videos, shouldPersist = true, options = {
   if (!channelId) return;
   const markFetched = options.markFetched !== false;
   const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || findChannel(channelId);
-  const acceptedVideos = channel ? (videos || []).filter((video) => trustedChannelVideo(video, channel)) : (videos || []);
+  const acceptedVideos = filterRemovedVideos(channel ? (videos || []).filter((video) => trustedChannelVideo(video, channel)) : (videos || []));
   cacheVideos(acceptedVideos, "channel", false);
-  const existing = state.channelVideoIds[channelId] || [];
+  const existing = filterRemovedVideoIds(state.channelVideoIds[channelId] || []);
   const seen = new Set(existing);
   for (const video of acceptedVideos) {
     if (video?.id && state.videoCache[video.id]) seen.add(video.id);
   }
   state.channelVideoIds[channelId] = [...seen];
+  bumpDataRevision();
   if (markFetched) state.channelFetchedAt[channelId] = Date.now();
   if (shouldPersist) persist();
 }
@@ -4664,8 +4824,9 @@ function setPlayerFallback(title, message, code) {
 
 function togglePlayback() {
   if (!state.currentVideo) {
-    const first = lastVisibleVideos[0] || demoVideos[0];
-    playVideo(first, lastVisibleVideos.length ? lastVisibleVideos : demoVideos);
+    const fallbackVideos = demoVideos.filter((video) => !isRemovedVideoId(video.id));
+    const first = lastVisibleVideos[0] || fallbackVideos[0];
+    if (first) playVideo(first, lastVisibleVideos.length ? lastVisibleVideos : fallbackVideos);
     return;
   }
 
@@ -4847,6 +5008,7 @@ function findNextPlayableIndex(direction) {
 }
 
 function toggleLike(video) {
+  if (isRemovedVideoId(video?.id)) return;
   cacheVideo(video, "liked", false);
   if (isLiked(video.id)) {
     delete state.likedVideos[video.id];
@@ -4856,6 +5018,7 @@ function toggleLike(video) {
   state.recommendations = [];
   state.recommendedChannels = [];
   state.dailyPlaylists = { date: "", playlists: [] };
+  bumpDataRevision();
   persist();
   render();
 }
@@ -4871,6 +5034,7 @@ function toggleFollow(channel) {
   state.recommendations = [];
   state.recommendedChannels = [];
   state.dailyPlaylists = { date: "", playlists: [] };
+  bumpDataRevision();
   persist();
   render();
 }
@@ -4887,7 +5051,7 @@ function channelFromVideo(video) {
 }
 
 function hasRecording(videoId) {
-  return Boolean(videoId && state.recordings?.[videoId]);
+  return Boolean(videoId && !isRemovedVideoId(videoId) && state.recordings?.[videoId]);
 }
 
 function isSpotifyVideo(video) {
@@ -4896,6 +5060,7 @@ function isSpotifyVideo(video) {
 
 function getRecordedVideos() {
   return Object.keys(state.recordings || {})
+    .filter((id) => !isRemovedVideoId(id))
     .map((id) => findVideo(id) || videoFromRecordingMetadata(id))
     .filter(Boolean)
     .sort((a, b) => recordingSortValue(b.id) - recordingSortValue(a.id));
@@ -4927,6 +5092,7 @@ function videoFromRecordingMetadata(id) {
 
 function findVideo(id) {
   if (!id) return null;
+  if (isRemovedVideoId(id)) return null;
   return (
     state.searchResults.videos.find((video) => video.id === id) ||
     state.videoCache[id] ||
@@ -4954,15 +5120,16 @@ function findChannel(id) {
 }
 
 function isLiked(videoId) {
-  return Boolean(state.likedVideos[videoId]);
+  return Boolean(videoId && !isRemovedVideoId(videoId) && state.likedVideos[videoId]);
 }
 
 function isWatched(videoId) {
-  return Boolean(state.watchedVideos[videoId]);
+  return Boolean(videoId && !isRemovedVideoId(videoId) && state.watchedVideos[videoId]);
 }
 
 function markWatched(video, shouldPersist = true) {
   if (!video?.id) return false;
+  if (isRemovedVideoId(video.id)) return false;
   state.watchedVideos[video.id] = {
     id: video.id,
     title: video.title || "",
@@ -4971,7 +5138,7 @@ function markWatched(video, shouldPersist = true) {
   };
   state.watchedVideos = compactWatchedVideos(state.watchedVideos);
   const changed = removeVideoFromRecommendations(video.id);
-  if (changed) metadataMatrix = null;
+  bumpDataRevision();
   if (shouldPersist) persist();
   return changed;
 }
@@ -5006,6 +5173,7 @@ async function removeVideoFromCache(videoId) {
   if (!videoId) return;
   const video = findVideo(videoId) || state.videoCache[videoId] || state.likedVideos[videoId] || videoFromRecordingMetadata(videoId);
   const title = video?.title || "Video";
+  rememberRemovedVideo(video || { id: videoId });
 
   delete state.videoCache[videoId];
   delete state.likedVideos[videoId];
@@ -5054,6 +5222,7 @@ async function removeVideoFromCache(videoId) {
   }
 
   metadataMatrix = null;
+  bumpDataRevision();
   persist();
   render();
   showToast(`Removed ${title} from cache.`);
@@ -5069,14 +5238,68 @@ function isUnavailable(videoId) {
 
 function isPlayableVideo(video) {
   if (isSpotifyVideo(video)) return canUseSpotifyPlayback();
-  return Boolean(video?.id) && (hasRecording(video.id) || !isUnavailable(video.id));
+  return Boolean(video?.id) && !isRemovedVideoId(video.id) && (hasRecording(video.id) || !isUnavailable(video.id));
 }
 
 function getLocalRecommendations() {
-  const pool = uniqueVideos([...demoVideos, ...Object.values(state.videoCache), ...Object.values(state.likedVideos), ...state.searchResults.videos]);
-  const ranked = rankRecommendationVideos(pool).filter(isNewCreatorRecommendationVideo);
-  const fallback = demoVideos.filter(isNewCreatorRecommendationVideo);
-  return ranked.length ? ranked : fallback;
+  if (fastViewCache.localRecommendationsRevision === dataRevision) {
+    return fastViewCache.localRecommendations;
+  }
+  const ranked = rankFastRecommendationVideos(localRecommendationPool()).filter(isNewCreatorRecommendationVideo);
+  const fallback = rankFastRecommendationVideos(demoVideos).filter(isNewCreatorRecommendationVideo);
+  fastViewCache.localRecommendationsRevision = dataRevision;
+  fastViewCache.localRecommendations = ranked.length ? ranked : fallback;
+  return fastViewCache.localRecommendations;
+}
+
+function localRecommendationPool() {
+  const followedVideos = Object.keys(state.followedChannels || {})
+    .flatMap((channelId) => channelVideos(channelId).slice(0, 36));
+  const playlistVideos = (state.dailyPlaylists.playlists || [])
+    .flatMap((playlist) => (playlist.videoIds || []).map((id) => state.videoCache[id]).filter(Boolean));
+  return uniqueVideos([
+    ...state.recommendations,
+    ...playlistVideos,
+    ...state.searchResults.videos.slice(0, 80),
+    ...Object.values(state.likedVideos),
+    ...followedVideos,
+    ...recentCachedVideos(320),
+    ...demoVideos
+  ]);
+}
+
+function recentCachedVideos(limit) {
+  const videos = Object.values(state.videoCache || {});
+  return videos.slice(Math.max(0, videos.length - limit));
+}
+
+function rankFastRecommendationVideos(videos) {
+  const profileTerms = fastRecommendationProfileTerms();
+  return uniqueVideos(videos)
+    .filter(isRecommendationVideo)
+    .map((video) => ({ video, score: fastRecommendationScore(video, profileTerms) }))
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.video);
+}
+
+function fastRecommendationProfileTerms() {
+  const seeds = uniqueVideos([
+    ...Object.values(state.likedVideos || {}),
+    ...Object.keys(state.followedChannels || {}).flatMap((channelId) => channelVideos(channelId).slice(0, 12)),
+    state.currentVideo
+  ]);
+  return new Set(topProfileTerms(seeds.length ? seeds : recentCachedVideos(80), 40));
+}
+
+function fastRecommendationScore(video, profileTerms) {
+  const tokens = new Set(tokenize(`${video.title || ""} ${video.channelTitle || ""} ${(video.tags || []).join(" ")}`));
+  let matchScore = 0;
+  for (const token of tokens) if (profileTerms.has(token)) matchScore += 3;
+  const recency = video.publishedAt ? Math.max(0, 8 - (Date.now() - Date.parse(video.publishedAt)) / (180 * 24 * 60 * 60 * 1000)) : 0;
+  const popularity = Math.min(24, Math.log10(parseViewCount(video.viewCount) + 1) * 3);
+  const musicBoost = isLikelyMusicVideo(video) ? 8 : 0;
+  const currentBoost = state.currentVideo && sharedRecommendationTerms(video, state.currentVideo) >= 2 ? 6 : 0;
+  return matchScore + recency + popularity + musicBoost + currentBoost;
 }
 
 function rankVideos(videos) {
@@ -5343,7 +5566,7 @@ function uniqueVideos(videos) {
   const seen = new Set();
   const unique = [];
   for (const video of videos) {
-    if (!video?.id || seen.has(video.id)) continue;
+    if (!video?.id || seen.has(video.id) || isRemovedVideoId(video.id)) continue;
     seen.add(video.id);
     unique.push(video);
   }
