@@ -65,7 +65,7 @@ const RECOMMENDATION_RELATED_CHANNEL_LIMIT = 6;
 const RECOMMENDATION_RELATED_VIDEO_LIMIT = 24;
 const WATCH_HISTORY_LIMIT = Number.POSITIVE_INFINITY;
 const AVAILABILITY_MODEL_VERSION = 2;
-const CHANNEL_OWNERSHIP_MODEL_VERSION = 2;
+const CHANNEL_OWNERSHIP_MODEL_VERSION = 3;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
 const METADATA_MATRIX_CHANNEL_TERMS = 22;
@@ -156,6 +156,8 @@ const icons = {
   external: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="m10 14 11-11"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
   music: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
   queue: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.4 6.4L3 16"/><path d="M3 21v-5h5"/><path d="M3 12A9 9 0 0 1 18.4 5.6L21 8"/><path d="M21 3v5h-5"/></svg>',
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 6-12 12"/><path d="m6 6 12 12"/></svg>',
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20 6-11 11-5-5"/></svg>',
@@ -756,6 +758,16 @@ async function handleAction(action, target, event) {
 
   if (action === "find-more-channel") {
     await findMoreChannelVideos(target.dataset.channelId);
+    return;
+  }
+
+  if (action === "clean-channel") {
+    await cleanChannel(target.dataset.channelId);
+    return;
+  }
+
+  if (action === "copy-channel-link") {
+    await copyChannelLink(target.dataset.channelId);
     return;
   }
 
@@ -1561,15 +1573,18 @@ function renderChannelView() {
     ? `<img class="channel-hero-avatar" src="${escapeAttr(channel.thumbnail)}" alt="" loading="lazy">`
     : `<span class="channel-hero-avatar placeholder">${escapeHtml(initials(channel.title))}</span>`;
   const storedIds = state.channelVideoIds[state.activeChannelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => isLikelyMusicVideo(video) && videoBelongsToChannel(video, channel));
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => isLikelyMusicVideo(video) && trustedChannelVideo(video, channel));
   const cache = state.channelCache[state.activeChannelId] || (storedVideos.length ? { channel, videos: storedVideos, nextPageToken: "", loading: false } : null);
-  const allVideos = uniqueVideos([...(cache?.videos || []), ...storedVideos]).filter((video) => isLikelyMusicVideo(video) && videoBelongsToChannel(video, channel));
+  const allVideos = uniqueVideos([...(cache?.videos || []), ...storedVideos]).filter((video) => isLikelyMusicVideo(video) && trustedChannelVideo(video, channel));
   const videos = sortChannelVideos(applyChannelFilter(allVideos));
   lastVisibleVideos = videos;
   const showSkeleton = cache?.loading && !allVideos.length;
   const canDiscoverMore = canDiscoverMoreChannelVideos(channel, allVideos.length);
   const feedStatus = channelFeedStatus(channel.id);
   const feedBadgeClass = feedStatus === "Updated this hour" ? "green" : feedStatus === "Feed unavailable" ? "amber" : "";
+  const countLabel = state.channelFilter === "all"
+    ? `${videos.length} cached videos`
+    : `${videos.length} shown / ${allVideos.length} cached`;
 
   const action = isFollowing(channel.id)
     ? `<button class="pill-action active" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}"><span data-icon="check" aria-hidden="true"></span><span>Subscribed</span></button>`
@@ -1583,7 +1598,10 @@ function renderChannelView() {
           <p class="eyebrow">Creator</p>
           <h1 class="view-title">${escapeHtml(channel.title)}</h1>
           <p class="meta">${escapeHtml(channel.description || "Music videos")}</p>
-          <div class="badge-row"><span class="badge ${feedBadgeClass}">${escapeHtml(feedStatus)}</span></div>
+          <div class="badge-row">
+            <span class="badge ${feedBadgeClass}">${escapeHtml(feedStatus)}</span>
+            <span class="badge">${escapeHtml(countLabel)}</span>
+          </div>
         </div>
       </div>
       <div class="view-actions">
@@ -1592,6 +1610,14 @@ function renderChannelView() {
           <button type="button" class="segment ${state.channelFilter === "videos" ? "active" : ""}" data-action="set-channel-filter" data-filter="videos">Videos</button>
           <button type="button" class="segment ${state.channelFilter === "shorts" ? "active" : ""}" data-action="set-channel-filter" data-filter="shorts">Shorts</button>
         </div>
+        <button class="secondary-button compact-action" type="button" data-action="copy-channel-link" data-channel-id="${escapeAttr(channel.id)}" title="Copy channel link" aria-label="Copy channel link">
+          <span data-icon="copy" aria-hidden="true"></span>
+          <span>Copy</span>
+        </button>
+        <button class="secondary-button compact-action" type="button" data-action="clean-channel" data-channel-id="${escapeAttr(channel.id)}" title="Clean mixed channel videos" aria-label="Clean mixed channel videos">
+          <span data-icon="refresh" aria-hidden="true"></span>
+          <span>Clean</span>
+        </button>
         ${action}
       </div>
     </header>
@@ -1859,7 +1885,9 @@ function shouldAutoLoadChannelPage(channelId, activeCache) {
   if (!channelId || activeCache?.loading) return false;
   const lastAttemptAt = Number(channelAutoLoadRequests.get(channelId) || 0);
   if (Date.now() - lastAttemptAt < CHANNEL_PAGE_AUTO_REFRESH_RETRY_MS) return false;
-  const cachedVideos = uniqueVideos([...(activeCache?.videos || []), ...channelVideos(channelId)]).filter(isLikelyMusicVideo);
+  const channel = findChannel(channelId);
+  const cachedVideos = uniqueVideos([...(activeCache?.videos || []), ...channelVideos(channelId)])
+    .filter((video) => isLikelyMusicVideo(video) && (!channel || trustedChannelVideo(video, channel)));
   return !cachedVideos.length || shouldRefreshChannel(channelId) || shouldDiscoverChannel(channelId) || shouldDeepenChannel(channelId);
 }
 
@@ -1923,6 +1951,98 @@ async function findMoreChannelVideos(channelId) {
   } else {
     showToast("No more matching music videos found yet.");
   }
+}
+
+async function cleanChannel(channelId) {
+  if (!channelId) return;
+  const channel = findChannel(channelId);
+  if (!channel) {
+    showToast("That channel is not in the cache yet.");
+    return;
+  }
+
+  const removed = cleanChannelCache(channelId);
+  render();
+  showToast(removed ? `Cleaned ${removed} mixed channel videos.` : "Channel cache already looks clean.");
+
+  if (canDiscoverMoreChannelVideos(channel, channelVideos(channelId).length)) {
+    await expandChannelDiscovery(channelId, true, { renderUpdates: true, limit: CHANNEL_DISCOVERY_IMPORT_LIMIT });
+  }
+}
+
+function cleanChannelCache(channelId) {
+  const channel = findChannel(channelId);
+  if (!channel) return 0;
+  let removed = 0;
+
+  const ids = state.channelVideoIds[channelId] || [];
+  if (ids.length) {
+    const filteredIds = ids.filter((id) => {
+      const video = state.videoCache[id];
+      const keep = trustedChannelVideo(video, channel);
+      if (!keep) removed += 1;
+      return keep;
+    });
+    state.channelVideoIds[channelId] = filteredIds;
+  }
+
+  const cache = state.channelCache[channelId];
+  if (cache?.videos?.length) {
+    const keptIds = new Set(state.channelVideoIds[channelId] || []);
+    const filteredVideos = cache.videos.filter((video) => {
+      if (!video) return false;
+      if (keptIds.has(video.id)) return true;
+      const keep = trustedChannelVideo(video, channel);
+      if (!keep) removed += 1;
+      return keep;
+    });
+    state.channelCache[channelId] = { ...cache, channel, videos: uniqueVideos(filteredVideos), loading: false };
+  }
+
+  delete state.channelDiscoveryFetchedAt[channelId];
+  clearChannelVisibleCounts(channelId);
+  state.searchCache = {};
+  state.recommendations = [];
+  state.recommendedChannels = [];
+  state.dailyPlaylists = { date: "", playlists: [] };
+  metadataMatrix = null;
+  persist();
+  return removed;
+}
+
+function clearChannelVisibleCounts(channelId) {
+  for (const key of Object.keys(state.channelVisibleCounts || {})) {
+    if (key.startsWith(`${channelId}:`)) delete state.channelVisibleCounts[key];
+  }
+}
+
+async function copyChannelLink(channelId) {
+  if (!channelId) return;
+  const base = window.location.origin && window.location.origin !== "null"
+    ? `${window.location.origin}${window.location.pathname}`
+    : window.location.href.split("#")[0];
+  const url = `${base}#channel/${encodeURIComponent(channelId)}`;
+  await copyText(url);
+  showToast("Channel link copied.");
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {}
+
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  document.body.append(input);
+  input.select();
+  document.execCommand("copy");
+  input.remove();
 }
 
 async function runSearch(query, filter, options = {}) {
@@ -2642,6 +2762,8 @@ function videoFromOEmbed(videoId, watchUrl, metadata, options = {}) {
     title,
     channelId,
     channelTitle: authorName,
+    authorUrl,
+    channelUrl: authorUrl,
     thumbnail,
     publishedAt: "",
     duration: "",
@@ -2650,6 +2772,7 @@ function videoFromOEmbed(videoId, watchUrl, metadata, options = {}) {
     isShort,
     categoryId: MUSIC_CATEGORY_ID,
     tags: [...new Set(["youtube", "oembed", isShort ? "shorts" : "video", ...tokenize(title).slice(0, 8)])],
+    sources: ["oembed"],
     watchUrl
   };
   return { video, channel };
@@ -2761,7 +2884,7 @@ async function expandChannelDiscovery(channelId, force, options = {}) {
       channelHints
     });
     const imported = discovered
-      .filter((video) => videoBelongsToChannel(video, channel))
+      .filter((video) => trustedChannelVideo(video, channel))
       .map((video) => ({ ...video, channelId: channel.id, channelTitle: channel.title || video.channelTitle, sourceChannelId: video.sourceChannelId || channel.id }));
     for (const video of imported) cacheVideo(video, "channel-discovery", false);
 
@@ -2921,7 +3044,7 @@ async function discoverPopularChannelVideos(channel, profile) {
     queries.map((query) => discoverVideos(query, { limit: 8, enforceIntent: false }))
   );
   const discovered = results.flatMap((result) => result.status === "fulfilled" ? result.value : [])
-    .filter((video) => isLikelyMusicVideo(video) && videoBelongsToChannel(video, channel))
+    .filter((video) => isLikelyMusicVideo(video) && trustedChannelVideo(video, channel))
     .map((video) => ({ ...video, channelId: channel.id, channelTitle: channel.title || video.channelTitle }));
   if (discovered.length) {
     cacheChannel(channel, "related-recommendations", false);
@@ -3384,16 +3507,22 @@ function videoBelongsToChannel(video, channel) {
   if (video.channelId === channel.id) return true;
   if (isRssChannelId(channel.id)) return isRssChannelId(video.channelId) && video.channelId === channel.id;
   if (isRssChannelId(video.channelId)) return false;
-  const videoTitle = normalizeCreatorKey(video.channelTitle);
-  const channelTitle = normalizeCreatorKey(channel.title);
-  if (videoTitle && channelTitle && videoTitle === channelTitle) return true;
   const handle = normalizeCreatorKey(channelHandle(channel));
   const videoChannelKey = normalizeCreatorKey(video.channelId);
-  const channelUrl = normalizeCreatorKey(channel.url || channel.description);
+  const videoChannelUrl = normalizeCreatorKey(channelUrlFromVideo(video));
+  const channelUrl = normalizeCreatorKey(channel.url || channel.authorUrl || "");
   return Boolean(
     (handle && videoChannelKey && videoChannelKey === handle) ||
-    (channelUrl && videoTitle && channelUrl === videoTitle)
+    (channelUrl && videoChannelUrl && channelUrl === videoChannelUrl)
   );
+}
+
+function trustedChannelVideo(video, channel) {
+  return Boolean(video && channel && !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel));
+}
+
+function channelUrlFromVideo(video) {
+  return video?.authorUrl || video?.channelUrl || video?.url || "";
 }
 
 function demoSearch(query, filter) {
@@ -3585,7 +3714,7 @@ function channelVideos(channelId) {
   const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || null;
   return (state.channelVideoIds[channelId] || [])
     .map((id) => state.videoCache[id])
-    .filter((video) => video && (!channel || videoBelongsToChannel(video, channel)));
+    .filter((video) => video && (!channel || trustedChannelVideo(video, channel)));
 }
 
 function normalizeCreatorKey(value) {
@@ -3692,7 +3821,7 @@ function pruneAmbiguousChannelDiscoveryCache() {
     if (ids.length) {
       const filteredIds = ids.filter((id) => {
         const video = state.videoCache[id];
-        return video && !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel);
+        return trustedChannelVideo(video, channel);
       });
       if (filteredIds.length !== ids.length) {
         state.channelVideoIds[channelId] = filteredIds;
@@ -3707,7 +3836,7 @@ function pruneAmbiguousChannelDiscoveryCache() {
       const filteredVideos = cache.videos.filter((video) => {
         if (!video) return false;
         if (allowedIds.has(video.id)) return true;
-        return !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel);
+        return trustedChannelVideo(video, channel);
       });
       if (filteredVideos.length !== cache.videos.length) {
         cache.videos = filteredVideos;
@@ -3729,11 +3858,13 @@ function pruneAmbiguousChannelDiscoveryCache() {
 }
 
 function isAmbiguousChannelDiscoveryVideo(video, channel) {
-  if (!isRssChannelId(channel?.id)) return false;
+  if (!video || !channel?.id || channel.id.startsWith("demo-")) return false;
   if (video.sourceChannelId === channel.id) return false;
-  if ((video.tags || []).includes("rss")) return false;
-  if (video.channelId === channel.id && !(video.sources || []).length) return true;
-  return (video.sources || []).includes("channel-discovery");
+  if ((video.tags || []).includes("rss") && isRssChannelId(video.channelId) && video.channelId === channel.id) return false;
+  const sources = video.sources || [];
+  if (sources.includes("channel-discovery") && !video.sourceChannelId) return true;
+  if (!sources.length && video.channelId === channel.id && !isRssChannelId(channel.id)) return true;
+  return false;
 }
 
 function cacheVideos(videos, source = "seen", shouldPersist = true) {
@@ -3747,7 +3878,7 @@ function cacheVideo(video, source = "seen", shouldPersist = true) {
   if (video.channelId) cacheChannel(channelFromVideo(video), source, false);
   const existing = state.videoCache[video.id] || {};
   const compacted = compactVideo(video);
-  const sources = new Set([...(existing.sources || []), source]);
+  const sources = new Set([...(existing.sources || []), ...(video.sources || []), source]);
   state.videoCache[video.id] = {
     ...existing,
     ...compacted,
@@ -3771,6 +3902,8 @@ function compactVideo(video) {
     channelId: video.channelId || "",
     channelTitle: video.channelTitle || "YouTube creator",
     sourceChannelId: video.sourceChannelId || "",
+    authorUrl: video.authorUrl || "",
+    channelUrl: video.channelUrl || "",
     thumbnail: video.thumbnail || "",
     publishedAt: video.publishedAt || "",
     duration: video.duration || "",
@@ -3815,7 +3948,7 @@ function cacheChannelVideos(channelId, videos, shouldPersist = true, options = {
   if (!channelId) return;
   const markFetched = options.markFetched !== false;
   const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || findChannel(channelId);
-  const acceptedVideos = channel ? (videos || []).filter((video) => videoBelongsToChannel(video, channel)) : (videos || []);
+  const acceptedVideos = channel ? (videos || []).filter((video) => trustedChannelVideo(video, channel)) : (videos || []);
   cacheVideos(acceptedVideos, "channel", false);
   const existing = state.channelVideoIds[channelId] || [];
   const seen = new Set(existing);
@@ -4526,8 +4659,9 @@ function channelFromVideo(video) {
   return {
     id: video.channelId,
     title: video.channelTitle,
-    description: "YouTube creator",
+    description: video.authorUrl || video.channelUrl || "YouTube creator",
     thumbnail: video.thumbnail,
+    url: video.authorUrl || video.channelUrl || "",
     uploadsPlaylistId: uploadsPlaylistIdFromChannelId(video.channelId)
   };
 }

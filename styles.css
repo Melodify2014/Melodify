@@ -416,7 +416,7 @@ body:not(.is-offline) [data-nav="recorded"] {
   left: 12px;
   height: 2px;
   content: "";
-  background: linear-gradient(90deg, var(--green), var(--blue), var(--violet), var(--rose));
+  background: linear-gradient(90deg, rgba(36, 240, 120, 0), rgba(36, 240, 120, 0.82), rgba(79, 214, 232, 0.48), rgba(36, 240, 120, 0));
   opacity: 0;
   transition: opacity 170ms ease;
 }
@@ -438,7 +438,7 @@ body:not(.is-offline) [data-nav="recorded"] {
 .video-card.current::before,
 .channel-card.followed::before,
 .channel-row.followed::before {
-  opacity: 0.9;
+  opacity: 0.42;
 }
 
 .video-card.current {
@@ -766,6 +766,11 @@ body:not(.is-offline) [data-nav="recorded"] {
   color: var(--green);
 }
 
+.compact-action {
+  min-height: 38px;
+  padding: 0 12px;
+}
+
 .pill-action:disabled,
 .secondary-button:disabled,
 .icon-button:disabled,
@@ -887,10 +892,10 @@ body:not(.is-offline) [data-nav="recorded"] {
   top: -1px;
   right: 0;
   left: 0;
-  height: 2px;
+  height: 1px;
   content: "";
-  background: linear-gradient(90deg, var(--green), var(--blue), var(--violet), var(--rose), var(--gold));
-  opacity: 0.76;
+  background: linear-gradient(90deg, rgba(36, 240, 120, 0.58), rgba(79, 214, 232, 0.32), rgba(36, 240, 120, 0.18));
+  opacity: 0.42;
 }
 
 .track-panel {
@@ -1694,6 +1699,21 @@ svg {
     min-height: 38px;
     padding: 0;
     border-radius: 50%;
+  }
+
+  .compact-action {
+    width: 38px;
+    min-width: 38px;
+    padding: 0;
+    border-radius: 50%;
+  }
+
+  .compact-action span:last-child {
+    display: none;
+  }
+
+  .view-actions .pill-action span:last-child {
+    display: none;
   }
 
   #playerLike span:last-child,
