@@ -65,6 +65,7 @@ const RECOMMENDATION_RELATED_CHANNEL_LIMIT = 6;
 const RECOMMENDATION_RELATED_VIDEO_LIMIT = 24;
 const WATCH_HISTORY_LIMIT = Number.POSITIVE_INFINITY;
 const AVAILABILITY_MODEL_VERSION = 2;
+const CHANNEL_OWNERSHIP_MODEL_VERSION = 2;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
 const METADATA_MATRIX_CHANNEL_TERMS = 22;
@@ -281,6 +282,7 @@ const state = {
   channelVisibleCounts: {},
   recordings: {},
   dailyPlaylists: { date: "", playlists: [] },
+  channelOwnershipModelVersion: CHANNEL_OWNERSHIP_MODEL_VERSION,
   unavailableVideos: {},
   sessionBlockedVideos: {},
   recommendations: [],
@@ -412,6 +414,11 @@ async function hydrateState() {
       reEnableCachedVideos();
       persist();
     }
+    if (saved.channelOwnershipModelVersion !== CHANNEL_OWNERSHIP_MODEL_VERSION) {
+      pruneAmbiguousChannelDiscoveryCache();
+      state.channelOwnershipModelVersion = CHANNEL_OWNERSHIP_MODEL_VERSION;
+      persist();
+    }
   } catch {
     localStorage.removeItem(STATE_STORAGE);
   }
@@ -436,6 +443,7 @@ function applySavedState(saved = {}) {
   state.channelVisibleCounts = saved.channelVisibleCounts || {};
   state.recordings = saved.recordings || {};
   state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
+  state.channelOwnershipModelVersion = saved.channelOwnershipModelVersion || 1;
   state.recommendedChannels = saved.recommendedChannels || [];
   state.unavailableVideos = saved.availabilityModelVersion === AVAILABILITY_MODEL_VERSION ? saved.unavailableVideos || {} : {};
 }
@@ -473,6 +481,7 @@ function stateSnapshot() {
     channelVisibleCounts: state.channelVisibleCounts,
     recordings: state.recordings,
     dailyPlaylists: state.dailyPlaylists,
+    channelOwnershipModelVersion: CHANNEL_OWNERSHIP_MODEL_VERSION,
     recommendedChannels: state.recommendedChannels,
     unavailableVideos: state.unavailableVideos,
     availabilityModelVersion: AVAILABILITY_MODEL_VERSION,
@@ -493,6 +502,7 @@ function localStateSnapshot(snapshot) {
     channelVisibleCounts: snapshot.channelVisibleCounts,
     recordings: snapshot.recordings,
     unavailableVideos: snapshot.unavailableVideos,
+    channelOwnershipModelVersion: snapshot.channelOwnershipModelVersion,
     availabilityModelVersion: snapshot.availabilityModelVersion,
     savedAt: snapshot.savedAt,
     largeCacheStoredIn: "IndexedDB"
@@ -1547,10 +1557,13 @@ function renderRecommendedView() {
 
 function renderChannelView() {
   const channel = findChannel(state.activeChannelId) || { id: state.activeChannelId, title: "Creator", description: "", thumbnail: "" };
+  const avatar = channel.thumbnail
+    ? `<img class="channel-hero-avatar" src="${escapeAttr(channel.thumbnail)}" alt="" loading="lazy">`
+    : `<span class="channel-hero-avatar placeholder">${escapeHtml(initials(channel.title))}</span>`;
   const storedIds = state.channelVideoIds[state.activeChannelId] || [];
-  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter(isLikelyMusicVideo);
+  const storedVideos = storedIds.map((id) => state.videoCache[id]).filter(Boolean).filter((video) => isLikelyMusicVideo(video) && videoBelongsToChannel(video, channel));
   const cache = state.channelCache[state.activeChannelId] || (storedVideos.length ? { channel, videos: storedVideos, nextPageToken: "", loading: false } : null);
-  const allVideos = uniqueVideos([...(cache?.videos || []), ...storedVideos]).filter(isLikelyMusicVideo);
+  const allVideos = uniqueVideos([...(cache?.videos || []), ...storedVideos]).filter((video) => isLikelyMusicVideo(video) && videoBelongsToChannel(video, channel));
   const videos = sortChannelVideos(applyChannelFilter(allVideos));
   lastVisibleVideos = videos;
   const showSkeleton = cache?.loading && !allVideos.length;
@@ -1563,12 +1576,15 @@ function renderChannelView() {
     : `<button class="pill-action" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}"><span data-icon="user-plus" aria-hidden="true"></span><span>Subscribe</span></button>`;
 
   return `
-    <header class="view-header">
-      <div>
-        <p class="eyebrow">Creator</p>
-        <h1 class="view-title">${escapeHtml(channel.title)}</h1>
-        <p class="meta">${escapeHtml(channel.description || "Music videos")}</p>
-        <div class="badge-row"><span class="badge ${feedBadgeClass}">${escapeHtml(feedStatus)}</span></div>
+    <header class="view-header channel-hero">
+      <div class="channel-hero-copy">
+        ${avatar}
+        <div>
+          <p class="eyebrow">Creator</p>
+          <h1 class="view-title">${escapeHtml(channel.title)}</h1>
+          <p class="meta">${escapeHtml(channel.description || "Music videos")}</p>
+          <div class="badge-row"><span class="badge ${feedBadgeClass}">${escapeHtml(feedStatus)}</span></div>
+        </div>
       </div>
       <div class="view-actions">
         <div class="segmented compact" role="group" aria-label="Channel video filter">
@@ -1598,7 +1614,7 @@ function renderChannelEmptyState(channelId, totalVideos, canDiscoverMore, loadin
 
 function renderDailyPlaylist(playlist) {
   return `
-    <section>
+    <section class="playlist-section">
       <div class="section-heading">
         <h2 class="section-title">${escapeHtml(playlist.title)}</h2>
         <p class="meta">${escapeHtml(playlist.query || "Cached recommendations")}</p>
@@ -1670,10 +1686,19 @@ function renderVideoCard(video) {
   const channel = channelFromVideo(video);
   const spotify = isSpotifyVideo(video);
   const recorded = hasRecording(video.id);
+  const current = state.currentVideo?.id === video.id;
   const unavailable = !recorded && !isPlayableVideo(video);
   const views = !spotify ? formatViewCount(video.viewCount) : "";
   const baseStatus = spotify ? "Spotify track" : recorded ? "Recorded" : unavailable ? "Unavailable" : video.duration || "Music video";
   const status = views ? `${baseStatus} / ${views} views` : baseStatus;
+  const cardClasses = [
+    "video-card",
+    unavailable ? "unavailable" : "",
+    current ? "current" : "",
+    recorded ? "recorded" : "",
+    spotify ? "spotify" : ""
+  ].filter(Boolean).join(" ");
+  const thumbLabel = spotify ? "Spotify" : recorded ? "Recorded" : isShortVideo(video) ? "Short" : current ? "Playing" : "";
   const channelControl = spotify
     ? `<a class="link-button" href="${escapeAttr(video.spotifyUrl || "https://open.spotify.com")}" target="_blank" rel="noreferrer">${escapeHtml(video.channelTitle)}</a>`
     : `<button class="link-button" type="button" data-action="open-channel" data-channel-id="${escapeAttr(video.channelId)}">${escapeHtml(video.channelTitle)}</button>`;
@@ -1682,9 +1707,10 @@ function renderVideoCard(video) {
           ${icon(recorded ? "check" : "plus")}
         </button>`;
   return `
-    <article class="video-card ${unavailable ? "unavailable" : ""}">
+    <article class="${cardClasses}">
       <button class="thumb-button" type="button" data-action="${unavailable ? "noop" : "play"}" data-video-id="${escapeAttr(video.id)}" aria-label="Play ${escapeAttr(video.title)}" ${unavailable ? "disabled" : ""}>
         <img src="${escapeAttr(video.thumbnail)}" alt="" loading="lazy">
+        ${thumbLabel ? `<span class="thumb-badge">${escapeHtml(thumbLabel)}</span>` : ""}
         <span class="thumb-overlay">${icon(unavailable ? "alert" : spotify ? "music" : "play")}</span>
       </button>
       <div>
@@ -1716,7 +1742,7 @@ function renderChannelCard(channel, row = false) {
     ? `<img class="channel-avatar" src="${escapeAttr(channel.thumbnail)}" alt="" loading="lazy">`
     : `<span class="channel-avatar placeholder">${escapeHtml(initials(channel.title))}</span>`;
   return `
-    <article class="${row ? "channel-row" : "channel-card"}">
+    <article class="${row ? "channel-row" : "channel-card"} ${followed ? "followed" : ""}">
       ${avatar}
       <div>
         <button class="link-button channel-title" type="button" data-action="open-channel" data-channel-id="${escapeAttr(channel.id)}">${escapeHtml(channel.title)}</button>
@@ -2216,7 +2242,8 @@ async function discoverVideos(query, options = {}) {
   const discoveryResults = mergeVideoDiscoveryResults(texts);
   const urls = discoveryResults.map((result) => result.url);
   const viewHints = new Map(discoveryResults.map((result) => [parseYoutubeVideoId(result.url), result.viewCount]).filter(([id, views]) => id && views));
-  const imported = await importVideosFromUrls(urls, { query, limit, enforceIntent, viewHints });
+  const channelHints = new Map(discoveryResults.map((result) => [parseYoutubeVideoId(result.url), result.channelId]).filter(([id, channelId]) => id && channelId));
+  const imported = await importVideosFromUrls(urls, { query, limit, enforceIntent, viewHints, channelHints });
   if (!enforceIntent) return rankVideos(imported);
   return rankSearchVideos(imported, query);
 }
@@ -2231,7 +2258,7 @@ async function discoverVideoResults(query, type = "videos", limit = 18) {
 }
 
 async function importVideosFromUrls(urls, options = {}) {
-  const { query = "", limit = VIDEO_SEARCH_IMPORT_LIMIT, enforceIntent = true, viewHints = new Map() } = options;
+  const { query = "", limit = VIDEO_SEARCH_IMPORT_LIMIT, enforceIntent = true, viewHints = new Map(), channelHints = new Map() } = options;
   const imported = [];
   const candidates = uniqueStrings(urls).slice(0, Math.max(limit * 3, limit));
   for (let index = 0; index < candidates.length && imported.length < limit; index += VIDEO_IMPORT_CONCURRENCY) {
@@ -2239,8 +2266,13 @@ async function importVideosFromUrls(urls, options = {}) {
     const results = await Promise.all(batch.map((url) => importVideoFromUrl(url, { quiet: true, updateView: false, requireMusic: true, query, deferPersist: true })));
     for (const video of results) {
       const hintedViews = viewHints instanceof Map ? viewHints.get(video?.id) : 0;
+      const hintedChannelId = channelHints instanceof Map ? channelHints.get(video?.id) : "";
       if (video && hintedViews) {
         video.viewCount = bestViewCount(hintedViews, video.viewCount);
+        cacheVideo(video, "discovery", false);
+      }
+      if (video && hintedChannelId) {
+        video.sourceChannelId = hintedChannelId;
         cacheVideo(video, "discovery", false);
       }
       if (video && (!enforceIntent || matchesSearchIntent(video, query))) imported.push(video);
@@ -2336,10 +2368,11 @@ function mergeVideoDiscoveryResultSets(resultSets) {
 function mergeVideoDiscoveryResult(byUrl, results) {
   for (const result of results || []) {
     if (!result?.url) continue;
-    const existing = byUrl.get(result.url) || { url: result.url, viewCount: 0 };
+    const existing = byUrl.get(result.url) || { url: result.url, viewCount: 0, channelId: "" };
     byUrl.set(result.url, {
       url: result.url,
-      viewCount: Math.max(parseViewCount(existing.viewCount), parseViewCount(result.viewCount))
+      viewCount: Math.max(parseViewCount(existing.viewCount), parseViewCount(result.viewCount)),
+      channelId: existing.channelId || result.channelId || ""
     });
   }
 }
@@ -2349,17 +2382,38 @@ function extractYoutubeVideoResults(text) {
   const expanded = `${decoded}\n${decodeEscapedSearchText(decoded)}`;
   return extractYoutubeVideoUrls(text).map((url) => ({
     url,
-    viewCount: viewCountNearVideoId(expanded, parseYoutubeVideoId(url))
+    viewCount: viewCountNearVideoId(expanded, parseYoutubeVideoId(url)),
+    channelId: channelIdNearVideoId(expanded, parseYoutubeVideoId(url))
   }));
 }
 
 function viewCountNearVideoId(text, videoId) {
   if (!videoId) return 0;
+  return largestViewCountInText(snippetNearVideoId(text, videoId));
+}
+
+function channelIdNearVideoId(text, videoId) {
+  if (!videoId) return "";
+  const snippet = snippetNearVideoId(text, videoId);
+  const patterns = [
+    /"authorId"\s*:\s*"(UC[A-Za-z0-9_-]{22})"/i,
+    /"uploaderUrl"\s*:\s*"\/channel\/(UC[A-Za-z0-9_-]{22})"/i,
+    /"authorUrl"\s*:\s*"\/channel\/(UC[A-Za-z0-9_-]{22})"/i,
+    /(?:https?:\/\/(?:www\.)?youtube\.com)?\/channel\/(UC[A-Za-z0-9_-]{22})/i,
+    /(?:^|[^A-Za-z0-9_-])(UC[A-Za-z0-9_-]{22})(?:$|[^A-Za-z0-9_-])/i
+  ];
+  for (const pattern of patterns) {
+    const match = snippet.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return "";
+}
+
+function snippetNearVideoId(text, videoId) {
   const source = String(text || "");
   const index = source.indexOf(videoId);
-  if (index < 0) return 0;
-  const snippet = source.slice(Math.max(0, index - 700), Math.min(source.length, index + 1400));
-  return largestViewCountInText(snippet);
+  if (index < 0) return "";
+  return source.slice(Math.max(0, index - 900), Math.min(source.length, index + 1800));
 }
 
 function largestViewCountInText(text) {
@@ -2698,15 +2752,17 @@ async function expandChannelDiscovery(channelId, force, options = {}) {
       .map((result) => result.value);
     const candidates = mergeVideoDiscoveryResultSets(discoveryResults);
     const viewHints = new Map(candidates.map((result) => [parseYoutubeVideoId(result.url), result.viewCount]).filter(([id, views]) => id && views));
+    const channelHints = new Map(candidates.map((result) => [parseYoutubeVideoId(result.url), result.channelId]).filter(([id, discoveredChannelId]) => id && discoveredChannelId));
     const discovered = await importVideosFromUrls(candidates.map((result) => result.url), {
       query,
       limit,
       enforceIntent: false,
-      viewHints
+      viewHints,
+      channelHints
     });
     const imported = discovered
       .filter((video) => videoBelongsToChannel(video, channel))
-      .map((video) => ({ ...video, channelId: channel.id, channelTitle: channel.title || video.channelTitle }));
+      .map((video) => ({ ...video, channelId: channel.id, channelTitle: channel.title || video.channelTitle, sourceChannelId: video.sourceChannelId || channel.id }));
     for (const video of imported) cacheVideo(video, "channel-discovery", false);
 
     const videos = uniqueVideos([...(existing.videos || []), ...storedVideos, ...imported]);
@@ -3301,8 +3357,11 @@ function channelDiscoveryQueries(channel) {
   const base = channelDiscoveryQuery(channel);
   const title = cleanRecommendationPhrase(channel?.title || base);
   const handle = channelHandle(channel);
+  const channelId = isRssChannelId(channel?.id) ? channel.id : "";
   return uniqueStrings([
     base,
+    channelId ? `${title || "YouTube creator"} ${channelId} music videos` : "",
+    channelId ? `${channelId} latest music videos` : "",
     title ? `${title} music videos` : "",
     title ? `${title} official music videos` : "",
     title ? `${title} most viewed music videos` : "",
@@ -3320,12 +3379,21 @@ function channelHandle(channel) {
 
 function videoBelongsToChannel(video, channel) {
   if (!video || !channel) return false;
+  if (isRssChannelId(video.channelId) && video.channelId === channel.id) return true;
+  if (video.sourceChannelId) return video.sourceChannelId === channel.id;
   if (video.channelId === channel.id) return true;
+  if (isRssChannelId(channel.id)) return isRssChannelId(video.channelId) && video.channelId === channel.id;
+  if (isRssChannelId(video.channelId)) return false;
   const videoTitle = normalizeCreatorKey(video.channelTitle);
   const channelTitle = normalizeCreatorKey(channel.title);
-  if (videoTitle && channelTitle && (videoTitle === channelTitle || videoTitle.includes(channelTitle) || channelTitle.includes(videoTitle))) return true;
+  if (videoTitle && channelTitle && videoTitle === channelTitle) return true;
+  const handle = normalizeCreatorKey(channelHandle(channel));
+  const videoChannelKey = normalizeCreatorKey(video.channelId);
   const channelUrl = normalizeCreatorKey(channel.url || channel.description);
-  return Boolean(channelUrl && videoTitle && channelUrl.includes(videoTitle));
+  return Boolean(
+    (handle && videoChannelKey && videoChannelKey === handle) ||
+    (channelUrl && videoTitle && channelUrl === videoTitle)
+  );
 }
 
 function demoSearch(query, filter) {
@@ -3514,7 +3582,10 @@ function creatorMatchesQuery(channel, query) {
 }
 
 function channelVideos(channelId) {
-  return (state.channelVideoIds[channelId] || []).map((id) => state.videoCache[id]).filter(Boolean);
+  const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || null;
+  return (state.channelVideoIds[channelId] || [])
+    .map((id) => state.videoCache[id])
+    .filter((video) => video && (!channel || videoBelongsToChannel(video, channel)));
 }
 
 function normalizeCreatorKey(value) {
@@ -3606,6 +3677,65 @@ function pruneNonMusicCache() {
   }
 }
 
+function pruneAmbiguousChannelDiscoveryCache() {
+  let changed = false;
+  const channelIds = new Set([
+    ...Object.keys(state.channelVideoIds || {}),
+    ...Object.keys(state.channelCache || {})
+  ]);
+
+  for (const channelId of channelIds) {
+    const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || findChannel(channelId);
+    if (!channel) continue;
+
+    const ids = state.channelVideoIds[channelId] || [];
+    if (ids.length) {
+      const filteredIds = ids.filter((id) => {
+        const video = state.videoCache[id];
+        return video && !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel);
+      });
+      if (filteredIds.length !== ids.length) {
+        state.channelVideoIds[channelId] = filteredIds;
+        delete state.channelDiscoveryFetchedAt[channelId];
+        changed = true;
+      }
+    }
+
+    const cache = state.channelCache[channelId];
+    if (cache?.videos?.length) {
+      const allowedIds = new Set(state.channelVideoIds[channelId] || []);
+      const filteredVideos = cache.videos.filter((video) => {
+        if (!video) return false;
+        if (allowedIds.has(video.id)) return true;
+        return !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel);
+      });
+      if (filteredVideos.length !== cache.videos.length) {
+        cache.videos = filteredVideos;
+        cache.loading = false;
+        delete state.channelDiscoveryFetchedAt[channelId];
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    state.searchCache = {};
+    state.recommendations = [];
+    state.recommendedChannels = [];
+    state.dailyPlaylists = { date: "", playlists: [] };
+    metadataMatrix = null;
+  }
+  return changed;
+}
+
+function isAmbiguousChannelDiscoveryVideo(video, channel) {
+  if (!isRssChannelId(channel?.id)) return false;
+  if (video.sourceChannelId === channel.id) return false;
+  if ((video.tags || []).includes("rss")) return false;
+  if (video.channelId === channel.id && !(video.sources || []).length) return true;
+  return (video.sources || []).includes("channel-discovery");
+}
+
 function cacheVideos(videos, source = "seen", shouldPersist = true) {
   for (const video of videos || []) cacheVideo(video, source, false);
   if (shouldPersist) persist();
@@ -3640,6 +3770,7 @@ function compactVideo(video) {
     title: video.title || "Untitled music video",
     channelId: video.channelId || "",
     channelTitle: video.channelTitle || "YouTube creator",
+    sourceChannelId: video.sourceChannelId || "",
     thumbnail: video.thumbnail || "",
     publishedAt: video.publishedAt || "",
     duration: video.duration || "",
@@ -3683,10 +3814,12 @@ function cacheChannel(channel, source = "seen", shouldPersist = true) {
 function cacheChannelVideos(channelId, videos, shouldPersist = true, options = {}) {
   if (!channelId) return;
   const markFetched = options.markFetched !== false;
-  cacheVideos(videos, "channel", false);
+  const channel = state.cachedChannels[channelId] || state.channelCache[channelId]?.channel || findChannel(channelId);
+  const acceptedVideos = channel ? (videos || []).filter((video) => videoBelongsToChannel(video, channel)) : (videos || []);
+  cacheVideos(acceptedVideos, "channel", false);
   const existing = state.channelVideoIds[channelId] || [];
   const seen = new Set(existing);
-  for (const video of videos || []) {
+  for (const video of acceptedVideos) {
     if (video?.id && state.videoCache[video.id]) seen.add(video.id);
   }
   state.channelVideoIds[channelId] = [...seen];

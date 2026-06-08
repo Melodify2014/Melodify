@@ -607,6 +607,7 @@ server.listen(PORT, "0.0.0.0", () => {
 
 function searchPhrasesForQuery(query, type) {
   const cleanQuery = String(query || "").trim();
+  const channelId = cleanQuery.match(/UC[A-Za-z0-9_-]{22}/)?.[0] || "";
   const genreTerms = queryGenreTerms(query);
   const phraseGenres = preferredSearchGenreTerms(cleanQuery, genreTerms);
   const phrases = [];
@@ -618,6 +619,10 @@ function searchPhrasesForQuery(query, type) {
     phrases.push(`${cleanQuery} music shorts`);
     phraseGenres.forEach((genre) => phrases.push(`${genre} music shorts`));
   } else if (type === "channel-videos") {
+    if (channelId) {
+      phrases.push(`youtube.com/channel/${channelId}`);
+      phrases.push(`${channelId} music videos`);
+    }
     phrases.push(`${cleanQuery} music videos`);
     phrases.push(`${cleanQuery} YouTube channel videos`);
     phrases.push(`${cleanQuery} uploads`);
