@@ -20,7 +20,7 @@ const CHANNEL_CACHE_TTL_MS = 60 * 60 * 1000;
 const FOLLOWED_CHANNEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const CHANNEL_BACKGROUND_DISCOVERY_INTERVAL_MS = 60 * 1000;
 const CHANNEL_DEEP_DISCOVERY_RETRY_MS = 10 * 60 * 1000;
-const CHANNEL_DISCOVERY_TARGET_VIDEO_COUNT = 80;
+const CHANNEL_DISCOVERY_TARGET_VIDEO_COUNT = 200;
 const CHANNEL_BACKGROUND_DISCOVERY_BATCH_SIZE = 2;
 const CHANNEL_DISCOVERY_QUERY_LIMIT = 5;
 const CHANNEL_DISCOVERY_SHORT_QUERY_LIMIT = 2;
@@ -56,6 +56,8 @@ const SEARCH_CHANNEL_EXPANSION_LIMIT = 36;
 const SEARCH_CACHE_SCAN_BATCH_SIZE = 80;
 const SEARCH_CACHE_VIDEO_RESULT_LIMIT = 60;
 const SEARCH_CACHE_CHANNEL_RESULT_LIMIT = 12;
+const RECENT_SEARCH_LIMIT = 8;
+const VIDEO_GRID_BATCH_SIZE = 48;
 const RECOMMENDATION_DISCOVERY_QUERY_LIMIT = 5;
 const RECOMMENDATION_CHANNEL_QUERY_LIMIT = 4;
 const RECOMMENDATION_IMPORT_LIMIT = 16;
@@ -152,6 +154,7 @@ const icons = {
   "user-plus": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6"/><path d="M22 11h-6"/></svg>',
   external: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6"/><path d="m10 14 11-11"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>',
   music: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  queue: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>',
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 6-12 12"/><path d="m6 6 12 12"/></svg>',
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
   check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20 6-11 11-5-5"/></svg>',
@@ -274,6 +277,8 @@ const state = {
   channelDiscoveryFetchedAt: {},
   creatorIndex: {},
   searchCache: {},
+  recentSearches: [],
+  channelVisibleCounts: {},
   recordings: {},
   dailyPlaylists: { date: "", playlists: [] },
   unavailableVideos: {},
@@ -316,6 +321,7 @@ let channelBackgroundDiscoveryInFlight = false;
 let activeSearchRequestId = 0;
 let scheduledPersistTimer = 0;
 const channelAutoLoadRequests = new Map();
+const gridVisibleCounts = new Map();
 
 const els = {};
 
@@ -390,6 +396,7 @@ function cacheElements() {
   els.loopButton = document.getElementById("loopButton");
   els.playerRecording = document.getElementById("playerRecording");
   els.playerRecordingIcon = document.getElementById("playerRecordingIcon");
+  els.queueButton = document.getElementById("queueButton");
   els.playerLike = document.getElementById("playerLike");
   els.playerSubscribe = document.getElementById("playerSubscribe");
   els.youtubeLink = document.getElementById("youtubeLink");
@@ -425,6 +432,8 @@ function applySavedState(saved = {}) {
   state.channelDiscoveryFetchedAt = saved.channelDiscoveryFetchedAt || {};
   state.creatorIndex = saved.creatorIndex || {};
   state.searchCache = saved.searchCache || {};
+  state.recentSearches = Array.isArray(saved.recentSearches) ? saved.recentSearches.slice(0, RECENT_SEARCH_LIMIT) : [];
+  state.channelVisibleCounts = saved.channelVisibleCounts || {};
   state.recordings = saved.recordings || {};
   state.dailyPlaylists = saved.dailyPlaylists || { date: "", playlists: [] };
   state.recommendedChannels = saved.recommendedChannels || [];
@@ -460,6 +469,8 @@ function stateSnapshot() {
     channelDiscoveryFetchedAt: state.channelDiscoveryFetchedAt,
     creatorIndex: state.creatorIndex,
     searchCache: state.searchCache,
+    recentSearches: state.recentSearches,
+    channelVisibleCounts: state.channelVisibleCounts,
     recordings: state.recordings,
     dailyPlaylists: state.dailyPlaylists,
     recommendedChannels: state.recommendedChannels,
@@ -478,6 +489,8 @@ function localStateSnapshot(snapshot) {
     loop: snapshot.loop,
     recommendations: snapshot.recommendations.slice(0, 30),
     recommendedChannels: snapshot.recommendedChannels.slice(0, 16),
+    recentSearches: snapshot.recentSearches,
+    channelVisibleCounts: snapshot.channelVisibleCounts,
     recordings: snapshot.recordings,
     unavailableVideos: snapshot.unavailableVideos,
     availabilityModelVersion: snapshot.availabilityModelVersion,
@@ -622,6 +635,8 @@ function bindEvents() {
     await submitSearchInput();
   });
 
+  document.addEventListener("keydown", handleKeyboardShortcut);
+
   document.querySelectorAll("[data-filter]").forEach((button) => {
     button.addEventListener("click", async () => {
       state.filter = button.dataset.filter || "all";
@@ -687,6 +702,71 @@ async function submitSearchInput() {
 async function handleAction(action, target, event) {
   if (action === "close-modal") {
     closeModal();
+    return;
+  }
+
+  if (action === "continue-listening") {
+    if (state.currentVideo) togglePlayback();
+    return;
+  }
+
+  if (action === "recent-search") {
+    const query = target.dataset.query || "";
+    const filter = target.dataset.filter || "all";
+    if (query) {
+      state.filter = filter;
+      document.querySelectorAll("[data-filter]").forEach((item) => item.classList.toggle("active", item.dataset.filter === filter));
+      els.searchInput.value = query;
+      state.query = query;
+      location.hash = "search";
+      await runSearch(query, filter);
+    }
+    return;
+  }
+
+  if (action === "clear-recent-searches") {
+    state.recentSearches = [];
+    schedulePersist();
+    render();
+    showToast("Recent searches cleared.");
+    return;
+  }
+
+  if (action === "show-more-grid") {
+    showMoreGrid(target.dataset.gridKey, Number(target.dataset.total || 0));
+    render();
+    return;
+  }
+
+  if (action === "show-more-channel") {
+    showMoreChannelVideos(target.dataset.channelId, Number(target.dataset.total || 0));
+    render();
+    return;
+  }
+
+  if (action === "find-more-channel") {
+    await findMoreChannelVideos(target.dataset.channelId);
+    return;
+  }
+
+  if (action === "open-queue") {
+    openQueueModal();
+    return;
+  }
+
+  if (action === "play-queue-video") {
+    const video = findVideo(target.dataset.videoId);
+    if (video) {
+      closeModal();
+      await playVideo(video, state.queue.length ? state.queue : [video]);
+    }
+    return;
+  }
+
+  if (action === "clear-queue") {
+    clearQueue();
+    openQueueModal();
+    renderPlayer();
     return;
   }
 
@@ -1272,9 +1352,11 @@ function renderHomeView() {
         ${renderSpotifyConnectButton()}
       </div>
     </header>
+    ${renderContinueListening()}
+    ${renderRecentSearches()}
     <section>
       <h2 class="section-title">Recommended</h2>
-      ${renderVideoGrid(picks)}
+      ${renderVideoGrid(picks, { key: "home-picks" })}
     </section>
     ${channelHtml}
   `;
@@ -1301,6 +1383,47 @@ function renderSpotifyConnectButton() {
   `;
 }
 
+function renderContinueListening() {
+  const video = state.currentVideo;
+  if (!video) return "";
+  const source = isSpotifyVideo(video) ? "Spotify track" : hasRecording(video.id) ? "Offline recording" : "YouTube music video";
+  return `
+    <section class="continue-card">
+      <div class="continue-art" style="background-image: url('${escapeAttr(video.thumbnail || "")}')"></div>
+      <div>
+        <p class="eyebrow">Continue listening</p>
+        <h2>${escapeHtml(video.title || "Current video")}</h2>
+        <p class="meta">${escapeHtml(video.channelTitle || source)} / ${escapeHtml(source)}</p>
+      </div>
+      <button class="primary-button" type="button" data-action="continue-listening">
+        <span data-icon="${state.isPlaying ? "pause" : "play"}" aria-hidden="true"></span>
+        <span>${state.isPlaying ? "Pause" : "Play"}</span>
+      </button>
+    </section>
+  `;
+}
+
+function renderRecentSearches() {
+  const searches = (state.recentSearches || []).slice(0, RECENT_SEARCH_LIMIT);
+  if (!searches.length) return "";
+  return `
+    <section class="recent-searches" aria-label="Recent searches">
+      <div class="section-heading">
+        <h2 class="section-title">Recent searches</h2>
+        <button class="link-button quiet-action" type="button" data-action="clear-recent-searches">Clear</button>
+      </div>
+      <div class="chip-row">
+        ${searches.map((item) => `
+          <button class="search-chip" type="button" data-action="recent-search" data-query="${escapeAttr(item.query)}" data-filter="${escapeAttr(item.filter || "all")}">
+            <span data-icon="search" aria-hidden="true"></span>
+            <span>${escapeHtml(item.query)}</span>
+          </button>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
 function renderSearchView() {
   if (state.loading) return renderLoading("Discovering music videos");
   if (state.error) return renderStatus("Search paused", state.error, "alert");
@@ -1316,6 +1439,7 @@ function renderSearchView() {
           <h1 class="view-title">${title}</h1>
         </div>
       </header>
+      ${renderRecentSearches()}
       ${renderEmpty("No results found", "Melodify could not discover matching music videos yet.", "search")}
     `;
   }
@@ -1324,7 +1448,7 @@ function renderSearchView() {
     ? `<section><h2 class="section-title">Creators</h2>${renderChannelList(channels)}</section>`
     : "";
   const videoSection = videos.length && state.filter !== "channels"
-    ? `<section><h2 class="section-title">Music videos</h2>${renderVideoGrid(videos)}</section>`
+    ? `<section><h2 class="section-title">Music videos</h2>${renderVideoGrid(videos, { key: searchGridKey() })}</section>`
     : "";
   lastVisibleVideos = videos;
 
@@ -1351,7 +1475,7 @@ function renderLikedView() {
         <h1 class="view-title">Liked videos</h1>
       </div>
     </header>
-    ${renderVideoGrid(videos)}
+    ${renderVideoGrid(videos, { key: "liked" })}
   `;
 }
 
@@ -1368,7 +1492,7 @@ function renderRecordedView() {
         <h1 class="view-title">Recorded</h1>
       </div>
     </header>
-    ${renderVideoGrid(videos)}
+    ${renderVideoGrid(videos, { key: "recorded" })}
   `;
 }
 
@@ -1430,6 +1554,7 @@ function renderChannelView() {
   const videos = sortChannelVideos(applyChannelFilter(allVideos));
   lastVisibleVideos = videos;
   const showSkeleton = cache?.loading && !allVideos.length;
+  const canDiscoverMore = canDiscoverMoreChannelVideos(channel, allVideos.length);
   const feedStatus = channelFeedStatus(channel.id);
   const feedBadgeClass = feedStatus === "Updated this hour" ? "green" : feedStatus === "Feed unavailable" ? "amber" : "";
 
@@ -1454,8 +1579,21 @@ function renderChannelView() {
         ${action}
       </div>
     </header>
-    ${showSkeleton ? renderSkeletonGrid() : videos.length ? renderVideoGrid(videos) : renderEmpty("No music videos loaded", allVideos.length ? "Try a different channel filter." : "Melodify is searching this channel for music videos and Shorts.", "music")}
+    ${showSkeleton ? renderSkeletonGrid() : videos.length ? renderVideoGrid(videos, { channelId: channel.id, discoveryLoading: Boolean(cache?.loading), canDiscoverMore }) : renderChannelEmptyState(channel.id, allVideos.length, canDiscoverMore, Boolean(cache?.loading))}
   `;
+}
+
+function renderChannelEmptyState(channelId, totalVideos, canDiscoverMore, loading) {
+  const message = totalVideos ? "Try a different channel filter." : "Melodify is searching this channel for music videos and Shorts.";
+  const action = canDiscoverMore ? `
+    <div class="load-row">
+      <button class="secondary-button" type="button" data-action="find-more-channel" data-channel-id="${escapeAttr(channelId)}" ${loading ? "disabled" : ""}>
+        <span data-icon="sparkles" aria-hidden="true"></span>
+        <span>${loading ? "Finding more..." : "Find more videos"}</span>
+      </button>
+    </div>
+  ` : "";
+  return `${renderEmpty("No music videos loaded", message, "music")}${action}`;
 }
 
 function renderDailyPlaylist(playlist) {
@@ -1465,14 +1603,66 @@ function renderDailyPlaylist(playlist) {
         <h2 class="section-title">${escapeHtml(playlist.title)}</h2>
         <p class="meta">${escapeHtml(playlist.query || "Cached recommendations")}</p>
       </div>
-      ${renderVideoGrid(playlist.videos)}
+      ${renderVideoGrid(playlist.videos, { key: `playlist-${playlist.id}` })}
     </section>
   `;
 }
 
-function renderVideoGrid(videos) {
+function renderVideoGrid(videos, options = {}) {
   if (!videos.length) return renderEmpty("Nothing here yet", "Search or like a music video.", "music");
-  return `<div class="grid">${videos.map(renderVideoCard).join("")}</div>`;
+  const visibleCount = gridVisibleCount(options, videos.length);
+  const visibleVideos = videos.slice(0, visibleCount);
+  const moreCount = Math.max(0, videos.length - visibleVideos.length);
+  const grid = `<div class="grid">${visibleVideos.map(renderVideoCard).join("")}</div>`;
+  const controls = renderGridControls(options, visibleVideos.length, videos.length, moreCount);
+  return `${grid}${controls}`;
+}
+
+function gridVisibleCount(options, total) {
+  if (total <= VIDEO_GRID_BATCH_SIZE) return total;
+  if (options.channelId) {
+    const key = channelVisibleKey(options.channelId);
+    return Math.min(total, Math.max(VIDEO_GRID_BATCH_SIZE, Number(state.channelVisibleCounts[key] || VIDEO_GRID_BATCH_SIZE)));
+  }
+  const key = options.key || `${state.route || "grid"}:${state.query || ""}:${state.filter || ""}`;
+  return Math.min(total, Math.max(VIDEO_GRID_BATCH_SIZE, Number(gridVisibleCounts.get(key) || VIDEO_GRID_BATCH_SIZE)));
+}
+
+function renderGridControls(options, visibleCount, total, moreCount) {
+  const parts = [];
+  if (moreCount > 0) {
+    if (options.channelId) {
+      parts.push(`
+        <button class="secondary-button" type="button" data-action="show-more-channel" data-channel-id="${escapeAttr(options.channelId)}" data-total="${escapeAttr(total)}">
+          <span data-icon="plus" aria-hidden="true"></span>
+          <span>Show ${Math.min(VIDEO_GRID_BATCH_SIZE, moreCount)} more</span>
+        </button>
+      `);
+    } else {
+      const key = options.key || `${state.route || "grid"}:${state.query || ""}:${state.filter || ""}`;
+      parts.push(`
+        <button class="secondary-button" type="button" data-action="show-more-grid" data-grid-key="${escapeAttr(key)}" data-total="${escapeAttr(total)}">
+          <span data-icon="plus" aria-hidden="true"></span>
+          <span>Show ${Math.min(VIDEO_GRID_BATCH_SIZE, moreCount)} more</span>
+        </button>
+      `);
+    }
+  }
+
+  if (options.channelId && !moreCount && options.canDiscoverMore) {
+    parts.push(`
+      <button class="secondary-button" type="button" data-action="find-more-channel" data-channel-id="${escapeAttr(options.channelId)}" ${options.discoveryLoading ? "disabled" : ""}>
+        <span data-icon="sparkles" aria-hidden="true"></span>
+        <span>${options.discoveryLoading ? "Finding more..." : "Find more videos"}</span>
+      </button>
+    `);
+  }
+
+  if (options.discoveryLoading && visibleCount > 0) {
+    parts.push(`<span class="load-note">Searching this channel in the background...</span>`);
+  }
+
+  return parts.length ? `<div class="load-row">${parts.join("")}</div>` : "";
 }
 
 function renderVideoCard(video) {
@@ -1592,6 +1782,7 @@ function renderPlayer() {
   els.loopButton.classList.toggle("active", state.loop);
   els.playerRecording.disabled = !hasVideo || spotify;
   els.playerRecording.classList.toggle("active", hasLocalRecording);
+  if (els.queueButton) els.queueButton.disabled = !hasVideo && !state.queue.length;
   els.playerRecording.title = hasLocalRecording ? "Replace offline recording" : "Add offline recording";
   els.playerRecording.setAttribute("aria-label", hasVideo ? `${hasLocalRecording ? "Replace" : "Add"} offline recording for ${video.title}` : "Add offline recording");
   els.playerRecordingIcon.innerHTML = icon(hasLocalRecording ? "check" : "plus");
@@ -1646,9 +1837,72 @@ function shouldAutoLoadChannelPage(channelId, activeCache) {
   return !cachedVideos.length || shouldRefreshChannel(channelId) || shouldDiscoverChannel(channelId) || shouldDeepenChannel(channelId);
 }
 
+function searchGridKey() {
+  return `search:${state.filter || "all"}:${normalizeCreatorKey(state.query || "")}`;
+}
+
+function rememberRecentSearch(query, filter) {
+  const cleaned = String(query || "").trim();
+  if (!cleaned) return;
+  const item = {
+    query: cleaned,
+    filter: filter || "all",
+    searchedAt: new Date().toISOString()
+  };
+  const key = recentSearchKey(item);
+  state.recentSearches = [
+    item,
+    ...(state.recentSearches || []).filter((entry) => recentSearchKey(entry) !== key)
+  ].slice(0, RECENT_SEARCH_LIMIT);
+  schedulePersist();
+}
+
+function recentSearchKey(item) {
+  return `${String(item?.filter || "all").toLowerCase()}::${String(item?.query || "").trim().toLowerCase()}`;
+}
+
+function showMoreGrid(key, total) {
+  if (!key) return;
+  const current = Number(gridVisibleCounts.get(key) || VIDEO_GRID_BATCH_SIZE);
+  gridVisibleCounts.set(key, Math.min(Math.max(total, VIDEO_GRID_BATCH_SIZE), current + VIDEO_GRID_BATCH_SIZE));
+}
+
+function showMoreChannelVideos(channelId, total) {
+  if (!channelId) return;
+  const key = channelVisibleKey(channelId);
+  const current = Number(state.channelVisibleCounts[key] || VIDEO_GRID_BATCH_SIZE);
+  state.channelVisibleCounts[key] = Math.min(Math.max(total, VIDEO_GRID_BATCH_SIZE), current + VIDEO_GRID_BATCH_SIZE);
+  schedulePersist();
+}
+
+function channelVisibleKey(channelId) {
+  return `${channelId || ""}:${state.channelFilter || "all"}`;
+}
+
+function canDiscoverMoreChannelVideos(channel, cachedCount) {
+  return Boolean(channel?.id && !channel.id.startsWith("demo-") && !isOffline() && !isFileMode() && cachedCount < CHANNEL_DISCOVERY_TARGET_VIDEO_COUNT);
+}
+
+async function findMoreChannelVideos(channelId) {
+  if (!channelId) return;
+  const before = channelVideos(channelId).length;
+  await expandChannelDiscovery(channelId, true, { renderUpdates: true, limit: CHANNEL_DISCOVERY_IMPORT_LIMIT });
+  const after = channelVideos(channelId).length;
+  if (after > before) {
+    const key = channelVisibleKey(channelId);
+    state.channelVisibleCounts[key] = Math.max(Number(state.channelVisibleCounts[key] || VIDEO_GRID_BATCH_SIZE), Math.min(after, before + VIDEO_GRID_BATCH_SIZE));
+    schedulePersist();
+    render();
+    showToast(`Added ${after - before} more channel videos.`);
+  } else {
+    showToast("No more matching music videos found yet.");
+  }
+}
+
 async function runSearch(query, filter, options = {}) {
   const { force = false } = options;
   const requestId = ++activeSearchRequestId;
+  rememberRecentSearch(query, filter);
   state.route = "search";
   state.activeChannelId = "";
   state.loading = true;
@@ -4567,9 +4821,129 @@ function uniqueStrings(values) {
   return [...new Set((values || []).filter(Boolean))];
 }
 
+function openQueueModal() {
+  const queue = orderedQueueVideos();
+  const currentId = state.currentVideo?.id || "";
+  const rows = queue.length
+    ? queue.map((video, index) => renderQueueRow(video, index, video.id === currentId)).join("")
+    : `<p class="empty-copy">Play a music video and Melodify will build an Up Next queue from the current list.</p>`;
+  els.modalRoot.innerHTML = `
+    <section class="modal queue-modal" role="dialog" aria-modal="true" aria-label="Up Next">
+      <header class="modal-header">
+        <h2>Up Next</h2>
+        <button class="mini-action" type="button" data-action="close-modal" aria-label="Close">
+          <span data-icon="close" aria-hidden="true"></span>
+        </button>
+      </header>
+      <div class="modal-body">
+        <div class="queue-list">${rows}</div>
+      </div>
+      <footer class="modal-actions">
+        <p class="meta">${queue.length ? `${queue.length} videos in queue` : "Queue is empty"}</p>
+        <button class="secondary-button" type="button" data-action="clear-queue" ${queue.length ? "" : "disabled"}>
+          <span data-icon="close" aria-hidden="true"></span>
+          <span>Clear queue</span>
+        </button>
+      </footer>
+    </section>
+  `;
+  els.modalRoot.hidden = false;
+  installIcons(els.modalRoot);
+}
+
+function orderedQueueVideos() {
+  const queue = uniqueVideos(state.queue?.length ? state.queue : state.currentVideo ? [state.currentVideo] : []);
+  const currentId = state.currentVideo?.id || "";
+  const currentIndex = queue.findIndex((video) => video.id === currentId);
+  if (currentIndex <= 0) return queue;
+  return [queue[currentIndex], ...queue.slice(currentIndex + 1), ...queue.slice(0, currentIndex)];
+}
+
+function renderQueueRow(video, index, current) {
+  return `
+    <button class="queue-row ${current ? "active" : ""}" type="button" data-action="play-queue-video" data-video-id="${escapeAttr(video.id)}">
+      <span class="queue-index">${current ? icon("play") : index + 1}</span>
+      <span class="queue-thumb" style="background-image: url('${escapeAttr(video.thumbnail || "")}')"></span>
+      <span class="queue-copy">
+        <strong>${escapeHtml(video.title || "Untitled")}</strong>
+        <span>${escapeHtml(video.channelTitle || "Music video")}</span>
+      </span>
+    </button>
+  `;
+}
+
+function clearQueue() {
+  if (state.currentVideo) {
+    state.queue = [state.currentVideo];
+    state.queueIndex = 0;
+  } else {
+    state.queue = [];
+    state.queueIndex = -1;
+  }
+  persist();
+  showToast("Queue cleared.");
+}
+
 function closeModal() {
   els.modalRoot.hidden = true;
   els.modalRoot.innerHTML = "";
+}
+
+function handleKeyboardShortcut(event) {
+  const key = event.key;
+  const typing = isTypingTarget(event.target);
+  const mod = event.ctrlKey || event.metaKey;
+
+  if (mod && key.toLowerCase() === "k") {
+    event.preventDefault();
+    focusSearch();
+    return;
+  }
+
+  if (key === "Escape") {
+    if (!els.modalRoot.hidden) {
+      event.preventDefault();
+      closeModal();
+      return;
+    }
+    if (typing) event.target.blur();
+    return;
+  }
+
+  if (typing) return;
+
+  if (key === "/") {
+    event.preventDefault();
+    focusSearch();
+    return;
+  }
+
+  if (key === " " || event.code === "Space") {
+    event.preventDefault();
+    togglePlayback();
+    return;
+  }
+
+  if (key === "ArrowLeft") {
+    event.preventDefault();
+    playAdjacent(-1);
+    return;
+  }
+
+  if (key === "ArrowRight") {
+    event.preventDefault();
+    playAdjacent(1);
+  }
+}
+
+function isTypingTarget(target) {
+  const tag = target?.tagName?.toLowerCase();
+  return Boolean(target?.isContentEditable || tag === "input" || tag === "textarea" || tag === "select");
+}
+
+function focusSearch() {
+  els.searchInput.focus();
+  els.searchInput.select();
 }
 
 function showToast(message) {
