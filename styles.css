@@ -327,6 +327,14 @@ body:not(.is-offline) [data-nav="recorded"] {
   min-width: 68px;
 }
 
+.channel-filter {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.channel-filter .segment {
+  min-width: 62px;
+}
+
 .view {
   min-height: calc(100vh - 92px - var(--player-height));
   padding: 30px clamp(18px, 3.2vw, 42px) 48px;
@@ -1795,5 +1803,11 @@ svg {
   .play-button {
     width: 44px;
     height: 44px;
+  }
+}
+
+@media (max-width: 820px) {
+  .channel-filter {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
