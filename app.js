@@ -65,7 +65,7 @@ const RECOMMENDATION_RELATED_CHANNEL_LIMIT = 6;
 const RECOMMENDATION_RELATED_VIDEO_LIMIT = 24;
 const WATCH_HISTORY_LIMIT = Number.POSITIVE_INFINITY;
 const AVAILABILITY_MODEL_VERSION = 2;
-const CHANNEL_OWNERSHIP_MODEL_VERSION = 3;
+const CHANNEL_OWNERSHIP_MODEL_VERSION = 4;
 const METADATA_MATRIX_MAX_TERMS = 420;
 const METADATA_MATRIX_VIDEO_TERMS = 28;
 const METADATA_MATRIX_CHANNEL_TERMS = 22;
@@ -2393,6 +2393,7 @@ async function importVideosFromUrls(urls, options = {}) {
       }
       if (video && hintedChannelId) {
         video.sourceChannelId = hintedChannelId;
+        video.sourceChannelVerified = true;
         cacheVideo(video, "discovery", false);
       }
       if (video && (!enforceIntent || matchesSearchIntent(video, query))) imported.push(video);
@@ -2884,8 +2885,8 @@ async function expandChannelDiscovery(channelId, force, options = {}) {
       channelHints
     });
     const imported = discovered
-      .filter((video) => trustedChannelVideo(video, channel))
-      .map((video) => ({ ...video, channelId: channel.id, channelTitle: channel.title || video.channelTitle, sourceChannelId: video.sourceChannelId || channel.id }));
+      .map((video) => annotateChannelMatch(video, channel))
+      .filter(Boolean);
     for (const video of imported) cacheVideo(video, "channel-discovery", false);
 
     const videos = uniqueVideos([...(existing.videos || []), ...storedVideos, ...imported]);
@@ -3501,24 +3502,47 @@ function channelHandle(channel) {
 }
 
 function videoBelongsToChannel(video, channel) {
-  if (!video || !channel) return false;
-  if (isRssChannelId(video.channelId) && video.channelId === channel.id) return true;
-  if (video.sourceChannelId) return video.sourceChannelId === channel.id;
-  if (video.channelId === channel.id) return true;
-  if (isRssChannelId(channel.id)) return isRssChannelId(video.channelId) && video.channelId === channel.id;
-  if (isRssChannelId(video.channelId)) return false;
+  return Boolean(channelMatchKind(video, channel));
+}
+
+function channelMatchKind(video, channel) {
+  if (!video || !channel) return "";
+  if (isRssChannelId(video.channelId) && video.channelId === channel.id) return "id";
+  if (video.sourceChannelVerified && video.sourceChannelId === channel.id) return "id";
+  if (video.channelId === channel.id && !isAmbiguousChannelDiscoveryVideo(video, channel)) return isRssChannelId(channel.id) ? "id" : "pseudo-id";
+  if (isRssChannelId(channel.id)) return "";
+  if (isRssChannelId(video.channelId)) return "";
   const handle = normalizeCreatorKey(channelHandle(channel));
   const videoChannelKey = normalizeCreatorKey(video.channelId);
   const videoChannelUrl = normalizeCreatorKey(channelUrlFromVideo(video));
   const channelUrl = normalizeCreatorKey(channel.url || channel.authorUrl || "");
-  return Boolean(
-    (handle && videoChannelKey && videoChannelKey === handle) ||
-    (channelUrl && videoChannelUrl && channelUrl === videoChannelUrl)
-  );
+  if (handle && videoChannelKey && videoChannelKey === handle) return "handle";
+  if (channelUrl && videoChannelUrl && channelUrl === videoChannelUrl) return "url";
+  if (exactCreatorTitleMatches(video, channel)) return "title";
+  return "";
 }
 
 function trustedChannelVideo(video, channel) {
-  return Boolean(video && channel && !isAmbiguousChannelDiscoveryVideo(video, channel) && videoBelongsToChannel(video, channel));
+  return Boolean(video && channel && !isAmbiguousChannelDiscoveryVideo(video, channel) && channelMatchKind(video, channel));
+}
+
+function annotateChannelMatch(video, channel) {
+  const matchKind = channelMatchKind(video, channel);
+  if (!matchKind) return null;
+  return {
+    ...video,
+    channelId: channel.id,
+    channelTitle: exactCreatorTitleMatches(video, channel) ? video.channelTitle : channel.title || video.channelTitle,
+    channelMatchKind: matchKind,
+    sourceChannelId: video.sourceChannelVerified ? video.sourceChannelId : video.sourceChannelId || "",
+    sourceChannelVerified: Boolean(video.sourceChannelVerified)
+  };
+}
+
+function exactCreatorTitleMatches(video, channel) {
+  const videoTitle = normalizeCreatorKey(video?.channelTitle);
+  const channelTitle = normalizeCreatorKey(channel?.title);
+  return Boolean(videoTitle && channelTitle && videoTitle === channelTitle);
 }
 
 function channelUrlFromVideo(video) {
@@ -3859,10 +3883,12 @@ function pruneAmbiguousChannelDiscoveryCache() {
 
 function isAmbiguousChannelDiscoveryVideo(video, channel) {
   if (!video || !channel?.id || channel.id.startsWith("demo-")) return false;
-  if (video.sourceChannelId === channel.id) return false;
+  if (video.sourceChannelVerified && video.sourceChannelId === channel.id) return false;
+  if (video.channelMatchKind && exactCreatorTitleMatches(video, channel)) return false;
   if ((video.tags || []).includes("rss") && isRssChannelId(video.channelId) && video.channelId === channel.id) return false;
   const sources = video.sources || [];
   if (sources.includes("channel-discovery") && !video.sourceChannelId) return true;
+  if (sources.includes("channel-discovery") && !video.sourceChannelVerified && !video.channelMatchKind) return true;
   if (!sources.length && video.channelId === channel.id && !isRssChannelId(channel.id)) return true;
   return false;
 }
@@ -3902,6 +3928,8 @@ function compactVideo(video) {
     channelId: video.channelId || "",
     channelTitle: video.channelTitle || "YouTube creator",
     sourceChannelId: video.sourceChannelId || "",
+    sourceChannelVerified: Boolean(video.sourceChannelVerified),
+    channelMatchKind: video.channelMatchKind || "",
     authorUrl: video.authorUrl || "",
     channelUrl: video.channelUrl || "",
     thumbnail: video.thumbnail || "",
