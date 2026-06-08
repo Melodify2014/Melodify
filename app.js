@@ -610,6 +610,28 @@ async function readRecordingBlob(videoId) {
   }
 }
 
+async function deleteRecordingBlob(videoId) {
+  if (!videoId) return;
+  try {
+    const db = await openPersistentCacheDb();
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STATE_RECORDINGS_STORE, "readwrite");
+      const store = transaction.objectStore(STATE_RECORDINGS_STORE);
+      store.delete(videoId);
+      transaction.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error || new Error("Recording delete failed"));
+      };
+    });
+  } catch {
+    // If browser storage refuses the delete, removing state still hides the cached item.
+  }
+}
+
 async function requestPersistentStorage() {
   try {
     if (!navigator.storage?.persist) return;
@@ -814,6 +836,11 @@ async function handleAction(action, target, event) {
   if (action === "like") {
     const video = findVideo(target.dataset.videoId);
     if (video) toggleLike(video);
+    return;
+  }
+
+  if (action === "remove-video") {
+    await removeVideoFromCache(target.dataset.videoId);
     return;
   }
 
@@ -1804,6 +1831,9 @@ function renderVideoCard(video) {
         </button>
         <button class="mini-action ${isFollowing(channel.id) ? "active" : ""}" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}" aria-label="Subscribe to ${escapeAttr(channel.title)}" title="Subscribe">
           ${icon(isFollowing(channel.id) ? "check" : "user-plus")}
+        </button>
+        <button class="mini-action danger-action" type="button" data-action="remove-video" data-video-id="${escapeAttr(video.id)}" aria-label="Remove ${escapeAttr(video.title)} from cache" title="Remove from cache">
+          ${icon("close")}
         </button>
       </div>
     </article>
@@ -4970,6 +5000,63 @@ function removeVideoFromRecommendations(videoId) {
   if (playlists.length !== (state.dailyPlaylists.playlists || []).length) changed = true;
   state.dailyPlaylists = { ...state.dailyPlaylists, playlists };
   return changed;
+}
+
+async function removeVideoFromCache(videoId) {
+  if (!videoId) return;
+  const video = findVideo(videoId) || state.videoCache[videoId] || state.likedVideos[videoId] || videoFromRecordingMetadata(videoId);
+  const title = video?.title || "Video";
+
+  delete state.videoCache[videoId];
+  delete state.likedVideos[videoId];
+  delete state.watchedVideos[videoId];
+  delete state.unavailableVideos[videoId];
+  delete state.sessionBlockedVideos[videoId];
+  delete state.recordings[videoId];
+  await deleteRecordingBlob(videoId);
+
+  state.searchResults = {
+    ...state.searchResults,
+    videos: (state.searchResults.videos || []).filter((item) => item?.id !== videoId)
+  };
+
+  for (const [channelId, ids] of Object.entries(state.channelVideoIds || {})) {
+    const filtered = (ids || []).filter((id) => id !== videoId);
+    if (filtered.length) state.channelVideoIds[channelId] = filtered;
+    else delete state.channelVideoIds[channelId];
+  }
+
+  for (const cache of Object.values(state.channelCache || {})) {
+    if (!cache?.videos) continue;
+    cache.videos = cache.videos.filter((item) => item?.id !== videoId);
+    cache.loading = false;
+  }
+
+  for (const [key, entry] of Object.entries(state.searchCache || {})) {
+    const videoIds = (entry.videoIds || []).filter((id) => id !== videoId);
+    if (!videoIds.length && !(entry.channelIds || []).length) delete state.searchCache[key];
+    else entry.videoIds = videoIds;
+  }
+
+  removeVideoFromRecommendations(videoId);
+  state.queue = (state.queue || []).filter((item) => item?.id !== videoId);
+  state.queueIndex = Math.max(0, state.queue.findIndex((item) => item?.id === state.currentVideo?.id));
+  if (!state.queue.length) state.queueIndex = -1;
+
+  if (state.currentVideo?.id === videoId) {
+    state.currentVideo = null;
+    state.isPlaying = false;
+    state.queue = [];
+    state.queueIndex = -1;
+    playerBlocked = false;
+    resetPlayerElement();
+    setPlayerPlaceholder();
+  }
+
+  metadataMatrix = null;
+  persist();
+  render();
+  showToast(`Removed ${title} from cache.`);
 }
 
 function isFollowing(channelId) {

@@ -636,6 +636,11 @@ body:not(.is-offline) [data-nav="recorded"] {
   transform: translateY(-1px);
 }
 
+.danger-action:hover {
+  background: rgba(255, 92, 116, 0.12);
+  color: #ff7b8f;
+}
+
 .mini-action.active {
   background: var(--green-soft);
   color: var(--green);
