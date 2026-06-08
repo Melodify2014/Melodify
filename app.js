@@ -149,6 +149,8 @@ const icons = {
   search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   play: '<svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8 5 19 12 8 19 8 5"/></svg>',
   pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14"/><path d="M16 5v14"/></svg>',
+  "back-5": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6H4V2"/><path d="M4 6a9 9 0 1 1-1 4"/><path d="M10 15.5a2 2 0 1 0 2-2h-2v-4h4"/></svg>',
+  "forward-5": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 6h4V2"/><path d="M20 6a9 9 0 1 0 1 4"/><path d="M10 15.5a2 2 0 1 0 2-2h-2v-4h4"/></svg>',
   previous: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 20 9 12l10-8v16Z"/><path d="M5 19V5"/></svg>',
   next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 4 10 8-10 8V4Z"/><path d="M19 5v14"/></svg>',
   loop: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="m7 22-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',
@@ -399,10 +401,7 @@ function cacheElements() {
   els.playerChannel = document.getElementById("playerChannel");
   els.playButtonIcon = document.getElementById("playButtonIcon");
   els.loopButton = document.getElementById("loopButton");
-  els.playerRecording = document.getElementById("playerRecording");
-  els.playerRecordingIcon = document.getElementById("playerRecordingIcon");
   els.queueButton = document.getElementById("queueButton");
-  els.playerCopy = document.getElementById("playerCopy");
   els.playerLike = document.getElementById("playerLike");
   els.playerSubscribe = document.getElementById("playerSubscribe");
   els.youtubeLink = document.getElementById("youtubeLink");
@@ -872,6 +871,16 @@ async function handleAction(action, target, event) {
     return;
   }
 
+  if (action === "seek-backward") {
+    await seekPlayback(-5);
+    return;
+  }
+
+  if (action === "seek-forward") {
+    await seekPlayback(5);
+    return;
+  }
+
   if (action === "previous") {
     playAdjacent(-1);
     return;
@@ -886,16 +895,6 @@ async function handleAction(action, target, event) {
     state.loop = !state.loop;
     persist();
     renderPlayer();
-    return;
-  }
-
-  if (action === "current-recording" && state.currentVideo) {
-    await attachRecording(state.currentVideo);
-    return;
-  }
-
-  if (action === "current-copy") {
-    await copyCurrentVideoLink();
     return;
   }
 
@@ -1450,7 +1449,6 @@ function renderRecentSearches() {
     <section class="recent-searches" aria-label="Recent searches">
       <div class="section-heading">
         <h2 class="section-title">Recent searches</h2>
-        <button class="link-button quiet-action" type="button" data-action="clear-recent-searches">Clear</button>
       </div>
       <div class="chip-row">
         ${searches.map((item) => `
@@ -1641,10 +1639,6 @@ function renderChannelView() {
           <button type="button" class="segment ${state.channelFilter === "videos" ? "active" : ""}" data-action="set-channel-filter" data-filter="videos">Videos</button>
           <button type="button" class="segment ${state.channelFilter === "shorts" ? "active" : ""}" data-action="set-channel-filter" data-filter="shorts">Shorts</button>
         </div>
-        <button class="secondary-button compact-action" type="button" data-action="copy-channel-link" data-channel-id="${escapeAttr(channel.id)}" title="Copy channel link" aria-label="Copy channel link">
-          <span data-icon="copy" aria-hidden="true"></span>
-          <span>Copy</span>
-        </button>
         <button class="secondary-button compact-action" type="button" data-action="clean-channel" data-channel-id="${escapeAttr(channel.id)}" title="Clean mixed channel videos" aria-label="Clean mixed channel videos">
           <span data-icon="refresh" aria-hidden="true"></span>
           <span>Clean</span>
@@ -1776,10 +1770,6 @@ function renderVideoCard(video) {
   const channelControl = spotify
     ? `<a class="link-button" href="${escapeAttr(video.spotifyUrl || "https://open.spotify.com")}" target="_blank" rel="noreferrer">${escapeHtml(video.channelTitle)}</a>`
     : `<button class="link-button" type="button" data-action="open-channel" data-channel-id="${escapeAttr(video.channelId)}">${escapeHtml(video.channelTitle)}</button>`;
-  const recordingButton = spotify ? "" : `
-        <button class="mini-action ${recorded ? "active" : ""}" type="button" data-action="attach-recording" data-video-id="${escapeAttr(video.id)}" aria-label="${recorded ? "Replace" : "Add"} offline recording for ${escapeAttr(video.title)}" title="${recorded ? "Replace recording" : "Add offline recording"}">
-          ${icon(recorded ? "check" : "plus")}
-        </button>`;
   return `
     <article class="${cardClasses}">
       <button class="thumb-button" type="button" data-action="${unavailable ? "noop" : "play"}" data-video-id="${escapeAttr(video.id)}" aria-label="Play ${escapeAttr(video.title)}" ${unavailable ? "disabled" : ""}>
@@ -1796,7 +1786,6 @@ function renderVideoCard(video) {
         <button class="mini-action ${liked ? "active" : ""}" type="button" data-action="like" data-video-id="${escapeAttr(video.id)}" aria-label="${liked ? "Unlike" : "Like"} ${escapeAttr(video.title)}" title="${liked ? "Unlike" : "Like"}">
           ${icon("heart")}
         </button>
-        ${recordingButton}
         <button class="mini-action ${isFollowing(channel.id) ? "active" : ""}" type="button" data-action="subscribe" data-channel-id="${escapeAttr(channel.id)}" aria-label="Subscribe to ${escapeAttr(channel.title)}" title="Subscribe">
           ${icon(isFollowing(channel.id) ? "check" : "user-plus")}
         </button>
@@ -1880,13 +1869,7 @@ function renderPlayer() {
   els.trackArt.style.backgroundImage = hasVideo ? `url("${video.thumbnail}")` : "";
   els.playButtonIcon.innerHTML = icon(state.isPlaying ? "pause" : "play");
   els.loopButton.classList.toggle("active", state.loop);
-  els.playerRecording.disabled = !hasVideo || spotify;
-  els.playerRecording.classList.toggle("active", hasLocalRecording);
   if (els.queueButton) els.queueButton.disabled = !hasVideo && !state.queue.length;
-  if (els.playerCopy) els.playerCopy.disabled = !hasVideo;
-  els.playerRecording.title = hasLocalRecording ? "Replace offline recording" : "Add offline recording";
-  els.playerRecording.setAttribute("aria-label", hasVideo ? `${hasLocalRecording ? "Replace" : "Add"} offline recording for ${video.title}` : "Add offline recording");
-  els.playerRecordingIcon.innerHTML = icon(hasLocalRecording ? "check" : "plus");
   els.playerLike.disabled = !hasVideo;
   els.playerSubscribe.disabled = !hasVideo || spotify;
   els.youtubeLink.href = hasVideo ? videoExternalUrl(video) : "https://www.youtube.com";
@@ -4649,6 +4632,55 @@ function togglePlayback() {
   }
 }
 
+async function seekPlayback(deltaSeconds) {
+  if (!state.currentVideo) {
+    showToast("Play a video first.");
+    return;
+  }
+
+  const localPlayer = getLocalPlayer();
+  if (localPlayer) {
+    const duration = Number.isFinite(localPlayer.duration) ? localPlayer.duration : 0;
+    const target = clampSeekTime(localPlayer.currentTime + deltaSeconds, duration);
+    localPlayer.currentTime = target;
+    return;
+  }
+
+  if (isSpotifyVideo(state.currentVideo)) {
+    await seekSpotifyPlayback(deltaSeconds);
+    return;
+  }
+
+  if (!ytPlayer || !playerReady || typeof ytPlayer.getCurrentTime !== "function" || typeof ytPlayer.seekTo !== "function") {
+    showToast("Player is still loading.");
+    return;
+  }
+
+  const current = Number(ytPlayer.getCurrentTime() || 0);
+  const duration = typeof ytPlayer.getDuration === "function" ? Number(ytPlayer.getDuration() || 0) : 0;
+  ytPlayer.seekTo(clampSeekTime(current + deltaSeconds, duration), true);
+}
+
+async function seekSpotifyPlayback(deltaSeconds) {
+  if (!spotifyPlayer || typeof spotifyPlayer.getCurrentState !== "function" || typeof spotifyPlayer.seek !== "function") {
+    showToast("Spotify seeking is not ready.");
+    return;
+  }
+  try {
+    const playerState = await spotifyPlayer.getCurrentState();
+    const position = Number(playerState?.position || 0);
+    const duration = Number(playerState?.duration || 0);
+    await spotifyPlayer.seek(clampSeekTime((position / 1000) + deltaSeconds, duration / 1000) * 1000);
+  } catch {
+    showToast("Spotify could not seek right now.");
+  }
+}
+
+function clampSeekTime(time, duration) {
+  const max = Number.isFinite(duration) && duration > 0 ? Math.max(0, duration - 0.25) : Number.POSITIVE_INFINITY;
+  return Math.min(max, Math.max(0, Number(time) || 0));
+}
+
 function handlePlayerEnded() {
   const localPlayer = getLocalPlayer();
   if (state.loop) {
@@ -5222,10 +5254,6 @@ function openQueueModal() {
       </div>
       <footer class="modal-actions">
         <p class="meta">${queue.length ? `${queue.length} videos in queue` : "Queue is empty"}</p>
-        <button class="secondary-button" type="button" data-action="clear-queue" ${queue.length ? "" : "disabled"}>
-          <span data-icon="close" aria-hidden="true"></span>
-          <span>Clear queue</span>
-        </button>
       </footer>
     </section>
   `;
@@ -5308,13 +5336,13 @@ function handleKeyboardShortcut(event) {
 
   if (key === "ArrowLeft") {
     event.preventDefault();
-    playAdjacent(-1);
+    seekPlayback(-5);
     return;
   }
 
   if (key === "ArrowRight") {
     event.preventDefault();
-    playAdjacent(1);
+    seekPlayback(5);
   }
 }
 

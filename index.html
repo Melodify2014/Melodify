@@ -84,6 +84,9 @@
       </section>
 
       <section class="control-panel" aria-label="Playback controls">
+        <button class="icon-button" type="button" data-action="seek-backward" aria-label="Back 5 seconds" title="Back 5 seconds">
+          <span data-icon="back-5" aria-hidden="true"></span>
+        </button>
         <button class="icon-button" type="button" data-action="previous" aria-label="Previous" title="Previous">
           <span data-icon="previous" aria-hidden="true"></span>
         </button>
@@ -93,17 +96,14 @@
         <button class="icon-button" type="button" data-action="next" aria-label="Next" title="Next">
           <span data-icon="next" aria-hidden="true"></span>
         </button>
+        <button class="icon-button" type="button" data-action="seek-forward" aria-label="Forward 5 seconds" title="Forward 5 seconds">
+          <span data-icon="forward-5" aria-hidden="true"></span>
+        </button>
         <button class="icon-button" type="button" id="loopButton" data-action="toggle-loop" aria-label="Loop" title="Loop">
           <span data-icon="loop" aria-hidden="true"></span>
         </button>
-        <button class="icon-button" type="button" id="playerRecording" data-action="current-recording" aria-label="Add offline recording" title="Add offline recording" disabled>
-          <span id="playerRecordingIcon" data-icon="plus" aria-hidden="true"></span>
-        </button>
         <button class="icon-button" type="button" id="queueButton" data-action="open-queue" aria-label="Open up next queue" title="Up next">
           <span data-icon="queue" aria-hidden="true"></span>
-        </button>
-        <button class="icon-button" type="button" id="playerCopy" data-action="current-copy" aria-label="Copy current video link" title="Copy link" disabled>
-          <span data-icon="copy" aria-hidden="true"></span>
         </button>
         <button class="pill-action" type="button" id="playerLike" data-action="current-like" aria-label="Like current video" disabled>
           <span data-icon="heart" aria-hidden="true"></span>
